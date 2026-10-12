@@ -231,6 +231,13 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleKeepaliveNow(req)))
 	case req.Method == http.MethodGet && path == base+"/keepalive/status":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleKeepaliveStatus()))
+	case req.Method == http.MethodGet && path == base+"/cooldowns":
+		// Issue #35 (v0.9.57): the per-(credential, model) cooldown table —
+		// list (all, or one auth via ?auth_id=) and clear are the panel's
+		// "give this pair another chance now" actions, same as qoder.
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCooldownList(req)))
+	case req.Method == http.MethodPost && path == base+"/cooldowns/clear":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCooldownClear(req)))
 	case req.Method == http.MethodGet && path == base+"/models/groups":
 		status, payload := handleModelGroupsQuery(req)
 		return okEnvelope(mgmtJSONResponse(status, payload))

@@ -1463,5 +1463,13 @@ func handleModelForAuth(raw []byte) ([]byte, error) {
 	// plugin) and this credential's realm sub-key (channel-scoped).
 	tok, _ := extractAccessToken(req.StorageJSON)
 	models = filterExcludedModelsForRealm(models, req.Host, realmForStorage(req.StorageJSON, tok))
+	// Issue #35 (v0.9.57): drop (credential, model) pairs cooling after an
+	// upstream failure — the in-stream quota frame / empty-stream family —
+	// so the host's built-in scheduler stops offering the degraded pair and
+	// rotates to another candidate. Pinned models are filtered too: a pin
+	// declares "this credential serves these ids", not "upstream is healthy".
+	// req.AuthID follows the host auth-id convention (sanitized UID); empty
+	// (host versions without it) degrades to a no-op filter.
+	models = filterCoolingModels(req.AuthID, models)
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }

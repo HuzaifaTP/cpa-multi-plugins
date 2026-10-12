@@ -213,6 +213,42 @@ func extractLatestUserPrompt(messages []openAIMessage) string {
 	return ""
 }
 
+// latestUserImageParts counts image_url content parts in the LAST user
+// message (0 when its content is a plain string or an unparseable array).
+// History messages are deliberately out of scope: their parts were already
+// forwarded (and ignored upstream) before this guard existed, and an old
+// screenshot in a conversation must not retroactively fail every follow-up.
+func latestUserImageParts(messages []openAIMessage) int {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			return imagePartsInContent(messages[i].rawContent)
+		}
+	}
+	return 0
+}
+
+// imagePartsInContent counts parts with type "image_url" in one message's
+// structured content array.
+func imagePartsInContent(rawContent string) int {
+	raw := strings.TrimSpace(rawContent)
+	if !strings.HasPrefix(raw, "[") {
+		return 0
+	}
+	var parts []struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parts); err != nil {
+		return 0
+	}
+	n := 0
+	for _, p := range parts {
+		if p.Type == "image_url" {
+			n++
+		}
+	}
+	return n
+}
+
 // runeSafePrefix truncates to n runes without splitting UTF-8 sequences
 // (upstream truncates business.name to 30 runes the same way).
 func runeSafePrefix(s string, n int) string {
@@ -249,6 +285,22 @@ func buildQoderBody(req *openAIRequest, modelKey, userType string) ([]byte, erro
 	}
 
 	prompt := extractLatestUserPrompt(req.Messages)
+	// Issue #37: the QoderWork agent_chat_generation body has NO image field
+	// — the only channels are chat_context.text (the prompt string) and the
+	// messages passthrough, which the upstream gateway flattens to text.
+	// image_url parts therefore cannot reach the model: image-only requests
+	// used to die with the misleading "no user message in request", and
+	// mixed content silently lost the image while the model answered as if
+	// it had considered it. Both now fail explicitly and honestly; the fix
+	// is deliberately a plain error (no StatusCode) so no host version can
+	// re-read it as a credential-level failure — the request shape is the
+	// problem, not the account.
+	if n := latestUserImageParts(req.Messages); n > 0 {
+		return nil, fmt.Errorf(
+			"qoder 通道不支持图像输入（上游 agent_chat_generation 请求体没有图像字段）：最新用户消息携带 %d 个 image_url 部分，无法转发到上游——纯图像消息与图文混排同样会被拒绝；请将视觉请求路由到支持图像输入的提供商/模型。"+
+				" // The qoder channel is text-only (the upstream agent_chat_generation body carries no image field): the latest user message carries %d image_url part(s) that cannot be forwarded — image-only and mixed content are both rejected; route vision requests to a vision-capable provider.",
+			n, n)
+	}
 	if prompt == "" {
 		return nil, fmt.Errorf("no user message in request")
 	}

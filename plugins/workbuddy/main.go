@@ -342,7 +342,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.9.56"
+var version = "0.9.57"
 
 func wbRegistration() registration {
 	return registration{
@@ -814,6 +814,14 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
 		return nil, err
 	}
+	// Issue #35: cooldown fast-fail — a (credential, model) pair that just
+	// failed upstream (in-stream quota frame, empty stream, 429 family) fails
+	// here without an upstream call so the host rotates to another candidate
+	// instead of re-hammering the drained pair.
+	if err := modelCooldownError(req.AuthID, sa, upstreamModel); err != nil {
+		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
+		return nil, err
+	}
 	// CodeBuddy rejects non-stream requests (code 11101), so always stream
 	// upstream and fold the chunks into a single chat.completion object.
 	// prepareUpstreamBody does forceStream + normalizeTools + rewriteSystem +
@@ -837,6 +845,9 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		payload, _ := io.ReadAll(reader)
 		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(payload))
 		noteModelRateLimitFromPayload(authUID, upstreamModel, statusCode, string(payload))
+		// Issue #35: >=400 failures feed the per-(credential, model) cooldown
+		// table (6004 keeps its own registry — the classifier defers to it).
+		noteModelCooldownFailure(req.AuthID, sa, upstreamModel, statusCode, string(payload))
 		reconcileAfterExecutorError(req.AuthID, statusCode, string(payload))
 		// v0.12.18: 11102 model-catalog rejections become a bilingual,
 		// realm-aware actionable error; 0.9.14 adds 11115/WAF/Retry-After
@@ -848,6 +859,9 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	completion, err := aggregateCompletion(reader, req.Model)
 	if err != nil {
 		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
+		// Issue #35: in-stream frame errors / empty streams from the fold path
+		// feed the pair cooldown too (all three executor paths are wired).
+		noteModelCooldownFailure(req.AuthID, sa, upstreamModel, 0, err.Error())
 		return nil, err
 	}
 	publishUsage(req.Model, upstreamModel, authUID, started, usageDetailFromCompletion(completion), false, 0, "")
@@ -888,6 +902,11 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
 		return nil, err
 	}
+	// Issue #35: cooldown fast-fail (same contract as the non-stream path).
+	if err := modelCooldownError(req.AuthID, sa, upstreamModel); err != nil {
+		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
+		return nil, err
+	}
 	body := req.Payload
 	if len(body) == 0 {
 		body = req.OriginalRequest
@@ -904,6 +923,10 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		chunks, statusCode, errCollect := collectUpstreamStream(body, sa, sseFramed, collector, upstreamModel)
 		if errCollect != nil {
 			publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, errCollect.Error())
+			// Issue #35: the sync collector surfaces frame errors,
+			// empty streams and >=400s as its error — feed the pair
+			// cooldown so the NEXT request rotates candidates.
+			noteModelCooldownFailure(req.AuthID, sa, upstreamModel, statusCode, errCollect.Error())
 			return nil, errCollect
 		}
 		publishUsage(req.Model, upstreamModel, authUID, started, collector.detail(), false, 0, "")

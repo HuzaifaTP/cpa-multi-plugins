@@ -231,6 +231,9 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 		// The transport-level failure carries no upstream status; surface it to
 		// the hand-off as a plain pre-answer failure (status 0) so a stalled
 		// stream that errors before answering never opens the host stream.
+		// (Deliberately NOT tabled in cooldown.go: a transport hiccup says
+		// nothing about the pair — same reasoning as policy.go's
+		// transport-lifecycle wording.)
 		if !gate.fail(fmt.Errorf("http_error: %v", err)) {
 			return
 		}
@@ -243,6 +246,10 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 		errPayload, _ := io.ReadAll(newHostStreamReader(stream))
 		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(errPayload))
 		noteModelRateLimitFromPayload(authUID, upstreamModel, statusCode, string(errPayload))
+		// issue #35: >=400 failures also feed the per-(credential, model)
+		// cooldown table (6004 was just noted into its own registry; the
+		// classifier here defers to it, see cooldown.go).
+		noteModelCooldownFailure(authID, sa, upstreamModel, statusCode, string(errPayload))
 		if authUID != "" {
 			go reconcileByUID(authUID, statusCode, string(errPayload))
 		}
@@ -271,6 +278,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 	if !seenPayload {
 		message := emptyStreamError().Error()
 		publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, message)
+		noteModelCooldownFailure(authID, sa, upstreamModel, 0, message)
 		streamEmitError(streamID, message)
 		return
 	}
@@ -279,6 +287,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 	if err := scanner.Err(); err != nil {
 		readErr := upstreamReadError(err)
 		publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, readErr.Error())
+		noteModelCooldownFailure(authID, sa, upstreamModel, 0, readErr.Error())
 		streamEmitError(streamID, readErr.Error())
 		return
 	}
@@ -313,11 +322,19 @@ func pumpStreamFrames(scanner *bufio.Scanner, sink streamSink, gate *streamHeadG
 	// Issue #30: per-choice output scrubbers — strip the leading tag-block run
 	// the reasoning replay taught the model to emit (see tag_scrub.go).
 	scrubbers := map[int]*thoughtTagScrubber{}
+	// Issue #36: per-choice tool-call accumulator — the terminal chunk's
+	// finish_reason "stop" becomes "tool_calls" when the choice carried
+	// tool_calls (see finish_reason.go).
+	toolSeen := map[int]bool{}
 	for scanner.Scan() {
 		line := scanner.Text()
 		content, meaningful, frameErr := workBuddyStreamFrame(line)
 		if frameErr != nil {
 			publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, frameErr.Error())
+			// issue #35: an in-stream failure on a 200 stream feeds the
+			// per-(credential, model) cooldown table so the host scheduler
+			// stops re-offering the degraded pair (see cooldown.go).
+			noteModelCooldownFailure("", sa, upstreamModel, 0, frameErr.Error())
 			if gating {
 				// Classify from the raw frame body (the error string only
 				// carries a redacted/truncated copy) so 6004 etc. stay honest.
@@ -342,6 +359,7 @@ func pumpStreamFrames(scanner *bufio.Scanner, sink streamSink, gate *streamHeadG
 		if cleaned == "" {
 			continue
 		}
+		cleaned = fixFinishReasonToolCalls(cleaned, toolSeen)
 		payload := cleaned
 		if sseFramed {
 			payload = "data: " + cleaned
@@ -462,6 +480,8 @@ func aggregateSSEWithCollector(r io.Reader, sseFramed bool, collector *sseUsageC
 	seenPayload := false
 	// Issue #30: per-choice output scrubbers (see tag_scrub.go).
 	scrubbers := map[int]*thoughtTagScrubber{}
+	// Issue #36: per-choice tool-call accumulator (see finish_reason.go).
+	toolSeen := map[int]bool{}
 	for scanner.Scan() {
 		content, meaningful, frameErr := workBuddyStreamFrame(scanner.Text())
 		if frameErr != nil {
@@ -478,6 +498,7 @@ func aggregateSSEWithCollector(r io.Reader, sseFramed bool, collector *sseUsageC
 		if cleaned == "" {
 			continue
 		}
+		cleaned = fixFinishReasonToolCalls(cleaned, toolSeen)
 		if sseFramed {
 			cleaned = "data: " + cleaned
 		}
@@ -691,6 +712,13 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	if created == 0 {
 		created = time.Now().Unix()
 	}
+	// Issue #36: the intl/IDE upstream maps its internal end_turn to
+	// "stop" even after emitting tool_calls — a folded message carrying
+	// tool_calls must finish with "tool_calls" (see finish_reason.go).
+	foldCalls := 0
+	if v, ok := message["tool_calls"].([]map[string]any); ok {
+		foldCalls = len(v)
+	}
 	result := map[string]any{
 		"id":      firstNonEmpty(respID, "chatcmpl-workbuddy"),
 		"object":  "chat.completion",
@@ -699,7 +727,7 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		"choices": []map[string]any{{
 			"index":         0,
 			"message":       message,
-			"finish_reason": firstNonEmpty(finish, "stop"),
+			"finish_reason": foldedFinishReason(finish, foldCalls),
 		}},
 	}
 	if usage != nil {

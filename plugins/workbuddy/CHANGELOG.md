@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.9.57
+
+### Per-(credential, model) cooldown: a 200+refused stream now rotates the pool instead of pinning the session (issue #35)
+
+Field report (issue #35, fyzero): a workbuddy.ai Global account hitting a
+free-model (0x) **daily limit** answers with HTTP 200 + an in-stream error
+frame (or an immediately-empty stream) in ~300 ms. Usage monitoring logged
+`failed=0 in=0 out=0`, the host cooldown layer never fired (the 200 was
+already handed off; `stream_head_timeout` defaults to off), and
+`routing.session-affinity` kept pinning the conversation to the drained
+credential — the only recovery was disabling the account by hand. The
+6004 model rate limit had had its own registry since v0.9.32, but the
+quota/refused-stream family had no owner. This ports the qoder/zcode
+pattern (`cooldown.go`, qoder v0.8.18 / trae v0.12.76 lineage):
+
+1. **Classifier** (`recordUpstreamFailure`): rate-limit wording → 300 s
+   hold; empty streams and detected in-stream error frames → 60 s hold;
+   6004 and hard-credit exhaustion are deliberately NOT tabled (the
+   declared-reset registry and the account-level lifecycle/statusError
+   paths stay authoritative). The 60 s catch-all on the frame family is
+   the honest answer to the issue's open question — the Global gateway's
+   exact daily-limit payload has never been captured, and the frame
+   detector only fires on an upstream that REFUSED on a 200, so rotating
+   that pair briefly is strictly better than re-hammering it.
+2. **Every failure site is wired**: the async pump (frame errors,
+   empty-stream tail, read-error tail), the sync collector's error return,
+   the non-stream fold's error return, and both executors' >=400 and
+   transport-error branches. Transport-level (`http_error:`) wording is
+   deliberately not tabled (policy.go's transport-lifecycle reasoning).
+3. **Catalog filter** (`filterCoolingModels` in `handleModelForAuth`):
+   cooling pairs drop out of the per-credential model list, so the host's
+   built-in scheduler stops offering the degraded pair; empty `AuthID`
+   (older hosts) degrades to a no-op.
+4. **Scheduler agreement**: `scheduler_mode: credits` pickers skip
+   candidates whose (id, model) pair is cooling — same contract qoder's
+   picker has with its filter.
+5. **Executor fast-fail** (`modelCooldownError`): a cooling pair fails
+   before any upstream call, mirroring the 6004 fast-fail — plain,
+   status-less error copy that names the scope (pair, not credential) and
+   the automatic rotation.
+6. **Management surface**: `GET /v0/management/plugins/workbuddy/cooldowns`
+   (all, or `?auth_id=`) and `POST …/cooldowns/clear` (pair or account) —
+   the panel's "give this pair another chance now" actions, same as qoder.
+
+Deterministic release gates: the classification matrix (6004 deferral /
+account-level deferral / 300 s / 60 s / not-tabled families), key
+derivation (host auth-id convention, sanitized UID, provider fallback),
+never-shorten + lazy expiry + clear semantics, catalog filter (incl.
+case-insensitivity and the empty-AuthID no-op), scheduler skip incl. the
+all-cooling defers-to-host tail, fast-fail scoping (other model / other
+credential pass), and the management round-trip.
+
+### finish_reason:"stop" + non-empty tool_calls corrected on every path (issue #36)
+
+Field report (issue #36, onlyjco): with `login_region: intl` +
+`login_platform: ide`, `glm-5.3-flash` + tools returned 200 with
+`message.tool_calls` populated but `finish_reason:"stop"` — per the OpenAI
+contract this must be `"tool_calls"`, and every tool-calling agent loop
+breaks on the contradiction. Root cause is upstream: the intl/IDE
+(codebuddy.ai) conversion maps its internal Anthropic-style end_turn to
+"stop" without checking whether tool_calls were emitted. The plugin now
+owns the correction on all three executor paths
+(`finish_reason.go`):
+
+1. **Streaming** (async pump + sync collector): a per-choice tool-call
+   accumulator; the terminal chunk's `"stop"` becomes `"tool_calls"` when
+   that choice carried tool calls (a same-chunk tool fragment + finish
+   marker is handled in one pass; per-choice isolation is pinned).
+2. **Non-stream fold**: `foldedFinishReason` — calls present and upstream
+   said "stop" (or nothing) → `"tool_calls"`.
+3. **Narrow by construction**: only `"stop"` is rewritten. `"length"` /
+   `"content_filter"` / an already-correct `"tool_calls"` pass through
+   verbatim (truncation semantics and the dropTruncatedToolCalls contract
+   are pinned unchanged).
+
+On the issue's second concern (login_region scoping): routing is and
+remains per-credential — `upstreamBaseFor` keys off the auth file's
+domain, `platformForAuth` off its `LoginPlatform`, and `login_region` /
+`login_platform` only seed NEW logins (usage_config.go, sticky since
+v0.12.17). A CN account cannot be globally re-routed by config; the
+reporter's config-C repro implies the account was (re)logged in while
+login_region:intl was set, which rewrote its auth file onto the
+codebuddy.ai realm. The workaround advice (realm-scoped auth files) is
+exactly what the adoption naming (`workbuddy-intl-<uid>.json`, v0.9.44)
+already guarantees.
+
 ## 0.9.56
 
 ### Output-side scrubber: the tag format the reasoning replay teaches is now stripped from what clients receive (issue #30)

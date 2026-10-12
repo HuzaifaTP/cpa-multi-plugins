@@ -70,11 +70,20 @@ func handleSchedulerPick(raw []byte) ([]byte, error) {
 
 	// Collect workbuddy candidates only.
 	var wbCandidates []pluginapi.SchedulerAuthCandidate
+	// Issue #35 (v0.9.57): a candidate whose (account, request-model) pair is
+	// cooling after an upstream failure is skipped so the plugin-side picker
+	// agrees with the catalog filter (filterCoolingModels) the host-side
+	// routing uses. The request model is resolved through the same alias
+	// table the executors use so the key matches the recorded pair.
+	reqModel := resolveUpstreamModel(req.Model, nil)
 	for _, c := range req.Candidates {
 		if c.Provider != providerName {
 			continue
 		}
 		if candidateDisabled(c) {
+			continue
+		}
+		if reqModel != "" && modelIsCooling(c.ID, reqModel) {
 			continue
 		}
 		wbCandidates = append(wbCandidates, c)
