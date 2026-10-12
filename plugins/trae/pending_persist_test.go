@@ -160,6 +160,24 @@ func TestSubmitAfterRestartRestoresPending(t *testing.T) {
 	if lc := v.(*loginCtx); lc.authCode != "REAL-FORM-CODE-1" {
 		t.Fatalf("restored ctx authCode: %+v", lc)
 	}
+	// v0.12.76: the restored login's background self-completion now persists
+	// the stable device identity (.trae-device-identity-*.json) into the same
+	// dir BEFORE its (real-network) exchange — wait for that write to land so
+	// t.TempDir's RemoveAll never races a concurrent file creation
+	// (ENOTEMPTY). Waiting for the file suffices: after it the goroutine only
+	// ever DELETES files (pending login cleanup), which RemoveAll tolerates.
+	identitySeen := false
+	identityDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(identityDeadline) {
+		if _, err := os.Stat(deviceIdentityPath(dir, variantCN)); err == nil {
+			identitySeen = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !identitySeen {
+		t.Logf("device identity file did not appear within 3s — background self-completion may still race TempDir cleanup")
+	}
 	loginStates.Delete(state)
 }
 

@@ -231,6 +231,15 @@ func exchangeTokenCandidates(urls []string, body []byte) (raw []byte, err error)
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		if resp.StatusCode >= 400 {
+			if code, msg := upstreamErrorCode(data); code != "" {
+				// v0.12.76: 业务性拒绝（带 Volcengine ResponseMetadata.Error.Code 的 4xx）是
+				// 账号/请求状态，与候选源无关 —— 立即短路，不再向其余源多烧失败请求
+				//（20401 Device limit reached 绝不该再走到 www.trae.cn 的 WAF；issue #38
+				// 服务端安全层教训，对齐 v0.12.74 刷新路径的单源决策）。网络错误/404/5xx/
+				// HTML 体保持原回退行为。
+				return nil, fmt.Errorf("ExchangeToken failed: %s => HTTP %d upstream code=%s (%s)%s",
+					u, resp.StatusCode, code, truncate(msg, 160), loginExchangeErrorHint(code))
+			}
 			// 404 page not found and friends: try the next candidate.
 			// v0.12.24: surface the Volcengine-style
 			// ResponseMetadata.Error code+message instead of a
@@ -246,6 +255,32 @@ func exchangeTokenCandidates(urls []string, body []byte) (raw []byte, err error)
 		errs = append(errs, fmt.Sprintf("%s => no access token (body=%s)", u, truncate(string(data), 120)))
 	}
 	return nil, fmt.Errorf("ExchangeToken failed: %s", strings.Join(errs, " | "))
+}
+
+// upstreamErrorCode 解析 Volcengine 风格 ResponseMetadata.Error {Code, Message}；
+// 不存在该信封时返回 ""。与 surfaceUpstreamError 的差别：本函数返回原始
+// code/msg 供短路判断与提示拼接，而非拼接好的展示串。
+func upstreamErrorCode(data []byte) (code, msg string) {
+	var env struct {
+		ResponseMetadata struct {
+			Error struct {
+				Code    string `json:"Code"`
+				Message string `json:"Message"`
+			} `json:"Error"`
+		} `json:"ResponseMetadata"`
+	}
+	if err := json.Unmarshal(data, &env); err != nil {
+		return "", ""
+	}
+	return strings.TrimSpace(env.ResponseMetadata.Error.Code), strings.TrimSpace(env.ResponseMetadata.Error.Message)
+}
+
+// loginExchangeErrorHint 把登录交换的上游业务码映射为用户可执行的恢复指引。
+func loginExchangeErrorHint(code string) string {
+	if code == "20401" {
+		return " — 设备数已达上限（Device limit reached）：该账号绑定的设备位已满。请任选其一：① 在 Trae 官方客户端或网页端的设备管理中解绑不再使用的旧设备后重试登录；② 直接重试登录 —— v0.12.76 起本插件复用本机设备身份登录，不再每次消耗新设备位，若本机曾有该账号的成功凭证即可直接成功 (unbind an old device via the official Trae client/web, or simply retry the login — this install now reuses its own device identity)"
+	}
+	return ""
 }
 
 // surfaceUpstreamError extracts the Volcengine-style ResponseMetadata.Error

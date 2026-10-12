@@ -541,8 +541,12 @@ func intlhandleStartLogin(request []byte) ([]byte, error) {
 	}
 
 	// Step 5: Build verification URI with PKCE.
-	deviceID := newDeviceID()
-	machineID := newMachineID()
+	// v0.12.76: stable per-installation device identity (see main.go —
+	// ONE identity per install instead of one per login; the per-login
+	// minting burned server-side device slots until 403 code=20401
+	// Device limit reached locked accounts out, issue #38 余波).
+	ident := ensureLoginDeviceIdentity(host.AuthDir, variantIntl)
+	deviceID, machineID := ident.DeviceID, ident.MachineID
 	verificationURI := intlbuildVerificationURI(loginHost, intlverificationURIParams{
 		AuthFrom:      oauthAuthFrom,
 		PluginVersion: intlOauthPluginVersion,
@@ -584,6 +588,10 @@ func intlhandleStartLogin(request []byte) ([]byte, error) {
 		codeChallenge: codeChallenge,
 		deviceID:      deviceID,
 		machineID:     machineID,
+		// v0.12.76: 登录起点解析出的设备密钥对（稳定身份的一部分），
+		// 交换点复用并随凭证落盘。
+		devicePublicKey:  ident.DevicePublicKey,
+		devicePrivateKey: ident.DevicePrivateKey,
 	})
 
 	// v0.12.17: disk-persisted pending login — the paste box keeps working
@@ -597,9 +605,13 @@ func intlhandleStartLogin(request []byte) ([]byte, error) {
 		CodeChallenge: codeChallenge,
 		DeviceID:      deviceID,
 		MachineID:     machineID,
-		AuthDir:       host.AuthDir,
-		CreatedAt:     time.Now().Unix(),
-		ExpiresAt:     time.Now().Add(loginTTL).Unix(),
+		// v0.12.76: 稳定设备身份的密钥对随 pending 记录落盘，进程重启
+		// 后的 self-complete 仍复用同一对（不再现铸）。
+		DevicePublicKey:  ident.DevicePublicKey,
+		DevicePrivateKey: ident.DevicePrivateKey,
+		AuthDir:          host.AuthDir,
+		CreatedAt:        time.Now().Unix(),
+		ExpiresAt:        time.Now().Add(loginTTL).Unix(),
 	})
 
 	if ln != nil {
@@ -698,7 +710,10 @@ func intlhandlePollLogin(request []byte) ([]byte, error) {
 	// embedded in the login URL, and carries a fresh per-login EC P-256
 	// DevicePublicKey (an empty value 401s the same way — the official
 	// client uploads a bound public key on first exchange).
-	pubKeyPEM, privKeyPEM, keyErr := generateDeviceKeyPair()
+	// v0.12.76: the pair now comes from the stable login identity
+	// (carried from start-login / restored from the pending record)
+	// instead of a fresh mint per exchange.
+	pubKeyPEM, privKeyPEM, keyErr := deviceKeysForLogin(lc.devicePublicKey, lc.devicePrivateKey, lc.authDir, variantIntl)
 	if keyErr != nil {
 		// An exchange without the key pair would fail with 20405 anyway;
 		// fail here with the precise cause instead.
@@ -1174,7 +1189,10 @@ type intlloginCtx struct {
 	codeChallenge string
 	deviceID      string
 	machineID     string
-	loginHost     string
+	// v0.12.76: 登录起点解析出的设备密钥对（稳定身份的一部分），随凭证落盘。
+	devicePublicKey  string
+	devicePrivateKey string
+	loginHost        string
 	// userTag echoes the callback's userTag parameter (v0.12.24, cockpit-tools
 	// TraeCallbackPayload.user_tag): USTTP accounts exchange against the US
 	// origin (grow-normal.traeapi.us) instead of the SG default.

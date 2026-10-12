@@ -239,6 +239,14 @@ func intlexchangeTokenCandidates(urls []string, body []byte) (raw []byte, err er
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		if resp.StatusCode >= 400 {
+			if code, msg := upstreamErrorCode(data); code != "" {
+				// v0.12.76: 业务性拒绝（带 Volcengine ResponseMetadata.Error.Code 的 4xx）是
+				// 账号/请求状态，与候选源无关 —— 立即短路，不再向其余源多烧失败请求
+				//（issue #38 服务端安全层教训，对齐 v0.12.74 刷新路径的单源决策；
+				// CN 侧 oauth_fallback.go 同款）。网络错误/404/5xx/HTML 体保持原回退行为。
+				return nil, fmt.Errorf("ExchangeToken failed: %s => HTTP %d upstream code=%s (%s)%s",
+					u, resp.StatusCode, code, intltruncate(msg, 160), loginExchangeErrorHint(code))
+			}
 			// 404 page not found and friends: try the next candidate.
 			// v0.12.24: surface the Volcengine-style
 			// ResponseMetadata.Error code+message (e.g. 20405 +

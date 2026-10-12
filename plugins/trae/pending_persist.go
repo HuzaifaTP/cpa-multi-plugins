@@ -114,9 +114,13 @@ type pendingLoginRecord struct {
 	CodeChallenge string `json:"code_challenge,omitempty"`
 	DeviceID      string `json:"device_id"`
 	MachineID     string `json:"machine_id"`
-	AuthDir       string `json:"auth_dir"`
-	CreatedAt     int64  `json:"created_at"`
-	ExpiresAt     int64  `json:"expires_at"`
+	// v0.12.76: 稳定设备身份的密钥对（登录起点解析）随 pending 记录落盘，
+	// 重启后的 self-complete 复用同一对，不再现铸。
+	DevicePublicKey  string `json:"device_public_key,omitempty"`
+	DevicePrivateKey string `json:"device_private_key,omitempty"`
+	AuthDir          string `json:"auth_dir"`
+	CreatedAt        int64  `json:"created_at"`
+	ExpiresAt        int64  `json:"expires_at"`
 }
 
 // authDirCache remembers the last host-provided AuthDir. The resource routes
@@ -264,6 +268,7 @@ func restorePendingLoginState(state string) string {
 			loginTraceID: rec.State, codeVerifier: rec.CodeVerifier,
 			codeChallenge: rec.CodeChallenge, deviceID: rec.DeviceID,
 			machineID: rec.MachineID, loginHost: rec.LoginHost, authDir: dir,
+			devicePublicKey: rec.DevicePublicKey, devicePrivateKey: rec.DevicePrivateKey,
 			restored: true,
 		})
 		return rec.State
@@ -273,6 +278,7 @@ func restorePendingLoginState(state string) string {
 			expires: expires, loginTraceID: rec.State, codeVerifier: rec.CodeVerifier,
 			codeChallenge: rec.CodeChallenge, deviceID: rec.DeviceID,
 			machineID: rec.MachineID, authDir: dir,
+			devicePublicKey: rec.DevicePublicKey, devicePrivateKey: rec.DevicePrivateKey,
 			restored: true,
 		})
 		return rec.State
@@ -384,7 +390,9 @@ func selfCompleteCN(lc *loginCtx, source string) {
 			accessToken, refreshToken, expiresAt = a.AccessToken, a.RefreshToken, a.ExpiresAt
 		}
 	} else {
-		pubKeyPEM, privKeyPEM, keyErr := generateDeviceKeyPair()
+		// v0.12.76: 复用登录起点携带的稳定身份密钥对（无则回退解析
+		// 稳定身份），不再每次交换现铸新密钥。
+		pubKeyPEM, privKeyPEM, keyErr := deviceKeysForLogin(lc.devicePublicKey, lc.devicePrivateKey, lc.authDir, lc.variant)
 		if keyErr != nil {
 			fail(fmt.Sprintf("device key pair: %v", keyErr))
 			return
@@ -514,7 +522,9 @@ func selfCompleteIntl(lc *intlloginCtx, source string) {
 		fail("no authCode after restore")
 		return
 	}
-	pubKeyPEM, privKeyPEM, keyErr := generateDeviceKeyPair()
+	// v0.12.76: 复用登录起点携带的稳定身份密钥对（无则回退解析稳定
+	// 身份），不再每次交换现铸新密钥。
+	pubKeyPEM, privKeyPEM, keyErr := deviceKeysForLogin(lc.devicePublicKey, lc.devicePrivateKey, lc.authDir, variantIntl)
 	if keyErr != nil {
 		fail(fmt.Sprintf("device key pair: %v", keyErr))
 		return

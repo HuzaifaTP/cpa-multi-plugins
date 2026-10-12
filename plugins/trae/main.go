@@ -139,7 +139,7 @@ const (
 // version is injected at build time via -ldflags "-X main.version=...".
 // Keep the default in sync with the release tag: the shipped build.sh does
 // NOT inject it (only "-s -w"), so the plugin reports this literal value.
-var version = "0.12.75"
+var version = "0.12.76"
 
 var (
 	hostAPI *C.cliproxy_host_api
@@ -950,8 +950,15 @@ func startLoginWithVariant(request []byte, lv string) ([]byte, error) {
 	}
 
 	// Step 5: Build verification URI with PKCE challenge.
-	deviceID := newDeviceID()
-	machineID := newMachineID()
+	// v0.12.76: stable per-installation device identity — the official IDE
+	// reuses ONE identity per install; minting a fresh one per login
+	// registered a new server-side device every time and burned device
+	// slots until 403 code=20401 (Device limit reached) locked the
+	// account out of logging in (issue #38 余波). The key pair is part of
+	// that identity and is carried through the ctx/pending record so the
+	// exchange points reuse it instead of minting their own.
+	ident := ensureLoginDeviceIdentity(host.AuthDir, lv)
+	deviceID, machineID := ident.DeviceID, ident.MachineID
 	verificationURI := buildVerificationURI(loginHost, verificationURIParams{
 		AuthFrom:      oauthAuthFor(lv),
 		PluginVersion: oauthPluginVersion,
@@ -997,6 +1004,10 @@ func startLoginWithVariant(request []byte, lv string) ([]byte, error) {
 		codeChallenge: codeChallenge,
 		deviceID:      deviceID,
 		machineID:     machineID,
+		// v0.12.76: 登录起点解析出的设备密钥对（稳定身份的一部分），
+		// 交换点复用并随凭证落盘。
+		devicePublicKey:  ident.DevicePublicKey,
+		devicePrivateKey: ident.DevicePrivateKey,
 	})
 
 	// Step 7: accept loop only for the local-listener flow; resource
@@ -1016,9 +1027,13 @@ func startLoginWithVariant(request []byte, lv string) ([]byte, error) {
 		CodeChallenge: codeChallenge,
 		DeviceID:      deviceID,
 		MachineID:     machineID,
-		AuthDir:       host.AuthDir,
-		CreatedAt:     time.Now().Unix(),
-		ExpiresAt:     time.Now().Add(loginTTL).Unix(),
+		// v0.12.76: 稳定设备身份的密钥对随 pending 记录落盘，进程重启
+		// 后的 self-complete 仍复用同一对（不再现铸）。
+		DevicePublicKey:  ident.DevicePublicKey,
+		DevicePrivateKey: ident.DevicePrivateKey,
+		AuthDir:          host.AuthDir,
+		CreatedAt:        time.Now().Unix(),
+		ExpiresAt:        time.Now().Add(loginTTL).Unix(),
 	})
 
 	if ln != nil {
@@ -1063,6 +1078,9 @@ type loginCtx struct {
 	codeChallenge string
 	deviceID      string
 	machineID     string
+	// v0.12.76: 登录起点解析出的设备密钥对（稳定身份的一部分），随凭证落盘。
+	devicePublicKey  string
+	devicePrivateKey string
 
 	// authDir: host-provided auth dir (auth.login.start) enabling the
 	// .oauth callback-file fallback for resource-callback flows.
@@ -1402,8 +1420,11 @@ func handlePollLogin(request []byte) ([]byte, error) {
 		// now carries a fresh per-login EC P-256 DevicePublicKey (an
 		// empty value surfaces as HTTP 401 / business code 20405 — the
 		// official client uploads a bound public key on first exchange).
+		// v0.12.76: the pair now comes from the stable login identity
+		// (carried from start-login / restored from the pending record)
+		// instead of a fresh mint per exchange.
 		loginHost := lc.loginHost
-		pubKeyPEM, privKeyPEM, keyErr := generateDeviceKeyPair()
+		pubKeyPEM, privKeyPEM, keyErr := deviceKeysForLogin(lc.devicePublicKey, lc.devicePrivateKey, lc.authDir, lc.variant)
 		if keyErr != nil {
 			return fail(fmt.Sprintf("device key pair: %v", keyErr))
 		}
