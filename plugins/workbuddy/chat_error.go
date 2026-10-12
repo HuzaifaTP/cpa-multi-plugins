@@ -224,6 +224,13 @@ func streamFaultStatus(payload string) int {
 	if isModelScopedRateLimit(http.StatusTooManyRequests, payload) {
 		return 0
 	}
+	// Issue #35: 免费模型的每日限额帧（200 + 错误帧，形状未知→信封无关词族
+	// 分类）→ 429。这让开启 stream_head_timeout 的用户与同步路径拿到带状态
+	// 的失败信封，宿主冷却层可正确归属；per-(uid, model) 的 fast-fail 由
+	// noteStreamFrameLimit 武装。6004 优先级不变（上面先判，它保持 status 0）。
+	if isDailyQuotaFrame(payload) {
+		return http.StatusTooManyRequests
+	}
 	low := strings.ToLower(payload)
 	switch {
 	case containsAny(low, "unauthorized", "invalid token", "token expired", "未授权", "登录已失效", "登录失效"):
@@ -386,6 +393,12 @@ func translateChatUpstreamErrorFull(statusCode int, payload string, sa *storedAu
 		// declared reset instant and upstream's switch-models advice.
 		resetAt, resetKnown := parseRateLimitResetAt(payload)
 		return fmt.Errorf("%s | raw: %s", modelScopedRateLimitCopy(resetAt, resetKnown),
+			truncateRedacted(payload, 200))
+	case isDailyQuotaFrame(payload):
+		// Issue #35: 每日限额得到同结构但语义明确的“今日免费额度”文案
+		//（重置时刻优先取上游声明，否则 UTC+8 零点）——不写这条，用户只能
+		// 看到裸 "upstream 429: {json}"，既看不出是每日额度也不知何时恢复。
+		return fmt.Errorf("%s | raw: %s", dailyQuotaLimitCopy(payload),
 			truncateRedacted(payload, 200))
 	case isPromptTooLong(statusCode, payload):
 		// v0.9.16: 11115 码提及条件化——413 裸 HTML/空体与其他词族命中时

@@ -52,8 +52,10 @@ func TestRecordUpstreamFailureMatrix(t *testing.T) {
 		{"429 status", http.StatusTooManyRequests, `{"code":11120,"msg":"slow down"}`, true, cooldownReasonRateLimit},
 		{"soft limit wording", 0, "upstream rate limit exceeded", true, cooldownReasonRateLimit},
 		{"empty stream", 0, emptyStreamError().Error(), true, cooldownReasonUnknown},
-		{"in-stream error frame", 0, "workbuddy upstream error: {\"code\":50001,\"msg\":\"daily quota reached\"}", true, cooldownReasonUnknown},
+		{"in-stream error frame", 0, "workbuddy upstream error: {\"code\":50001,\"msg\":\"service temporarily unavailable\"}", true, cooldownReasonUnknown},
 		{"bare error event frame", 0, "workbuddy upstream error event", true, cooldownReasonUnknown},
+		{"daily quota wording (en)", 0, "workbuddy upstream error: {\"code\":50001,\"msg\":\"daily quota reached\"}", true, cooldownReasonDailyQuota},
+		{"daily quota wording (zh)", 0, "workbuddy upstream error: {\"code\":50001,\"msg\":\"今日免费模型请求次数已达上限\"}", true, cooldownReasonDailyQuota},
 		{"read error wording", 0, "upstream stream read error (unexpected EOF): connection reset", false, ""},
 		{"unknown body", 0, "something else entirely", false, ""},
 	}
@@ -80,6 +82,15 @@ func TestRecordUpstreamFailureMatrix(t *testing.T) {
 			cooldownMu.Unlock()
 			if entry.Reason != tc.want {
 				t.Fatalf("reason = %q, want %q", entry.Reason, tc.want)
+			}
+			if tc.want == cooldownReasonDailyQuota {
+				// 冻结时刻 2026-10-12 12:00 UTC = 20:00 UTC+8 → 午夜重置在
+				// 4 小时后（未携带可解析重置声明的回退点）。
+				wantUntil := time.Date(2026, 10, 13, 0, 0, 0, 0, wbDailyZone)
+				if !entry.Until.Equal(wantUntil) {
+					t.Fatalf("daily until = %v, want %v", entry.Until, wantUntil)
+				}
+				return
 			}
 			if got := entry.Until.Sub(cooldownNowFn()); got != wantTTL {
 				t.Fatalf("ttl = %v, want %v", got, wantTTL)

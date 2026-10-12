@@ -99,6 +99,45 @@ func authStateHeaders(region string) func(*http.Request) {
 	return func(r *http.Request) { loginHeadersFor(r, region) }
 }
 
+// loginEndpointsOverride（issue #36 测试缝）：非空时把登录三端点
+// （auth/state、auth/token、login/account，CN 与 Intl 路径同形）重定向到该
+// base，让 hermetic 测试用 httptest 服务器驱动完整登录流（与
+// growthChatBaseOverride 同型）。生产恒为空，三个 base 解析函数在生产路径
+// 与原常量拼接字节级等价。
+var loginEndpointsOverride string
+
+// loginStateBaseFor / loginTokenBaseFor / loginAccountBaseFor resolve the
+// per-realm login endpoint bases, honoring the test override above.
+func loginStateBaseFor(region string) string {
+	if loginEndpointsOverride != "" {
+		return loginEndpointsOverride + "/v2/plugin/auth/state?platform="
+	}
+	if region == regionIntl {
+		return upstreamBaseForRegion(region) + "/v2/plugin/auth/state?platform="
+	}
+	return endpointAuthStateBase
+}
+
+func loginTokenBaseFor(region string) string {
+	if loginEndpointsOverride != "" {
+		return loginEndpointsOverride + "/v2/plugin/auth/token?state="
+	}
+	if region == regionIntl {
+		return upstreamBaseForRegion(region) + "/v2/plugin/auth/token?state="
+	}
+	return endpointAuthToken
+}
+
+func loginAccountBaseFor(region string) string {
+	if loginEndpointsOverride != "" {
+		return loginEndpointsOverride + "/v2/plugin/login/account?state="
+	}
+	if region == regionIntl {
+		return upstreamBaseForRegion(region) + "/v2/plugin/login/account?state="
+	}
+	return endpointLoginAcct
+}
+
 func handleStartLogin(raw []byte) ([]byte, error) {
 	return startLoginWithRegion(raw, loadedLoginRegion())
 }
@@ -111,12 +150,11 @@ func startLoginWithRegion(raw []byte, region string) ([]byte, error) {
 	client := newLoginClient()
 	platform := currentLoginPlatform()
 	headers := authStateHeaders(region)
-	stateBase := endpointAuthStateBase
+	stateBase := loginStateBaseFor(region)
 	if region == regionIntl {
 		// The codebuddy.ai login entry is the IDE client only (merged
 		// codebuddy-intl plugin behavior).
 		platform = "ide"
-		stateBase = upstreamBaseForRegion(region) + "/v2/plugin/auth/state?platform="
 	}
 	data, _, err := doJSON(client, http.MethodPost, stateBase+platform, headers, bytes.NewReader([]byte("{}")))
 	if err != nil {
@@ -127,7 +165,9 @@ func startLoginWithRegion(raw []byte, region string) ([]byte, error) {
 	if st.State == "" || st.AuthURL == "" {
 		return nil, fmt.Errorf("auth state: missing state or authUrl — please restart the login flow")
 	}
-	loginStates.Store(st.State, &loginCtx{client: client, region: region, expires: time.Now().Add(loginTTL)})
+	// issue #36（Part 2）：把实际使用的平台随登录态存下——poll 成功时写进
+	// sa.Auth.LoginPlatform，钉死 token 血统的作用域（方言头族）。
+	loginStates.Store(st.State, &loginCtx{client: client, region: region, platform: platform, expires: time.Now().Add(loginTTL)})
 	return okEnvelope(pluginapi.AuthLoginStartResponse{
 		Provider:  providerName,
 		URL:       st.AuthURL,
@@ -162,10 +202,9 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 	// with the token bundle once complete. login/account sits behind the
 	// openresty gateway and is rejected (401) until login finishes, so probe
 	// token first and only fetch account once we hold a bearer.
-	tokenBase := endpointAuthToken
+	tokenBase := loginTokenBaseFor(lc.region)
 	var tokenHeaders func(*http.Request)
 	if lc.region == regionIntl {
-		tokenBase = upstreamBaseForRegion(lc.region) + "/v2/plugin/auth/token?state="
 		tokenHeaders = func(r *http.Request) { loginHeadersFor(r, lc.region) }
 	}
 	tokRaw, status, errTok := doJSON(lc.client, http.MethodGet, tokenBase+state, tokenHeaders, nil)
@@ -235,6 +274,10 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 	// labels resolve via accountRegion; domain sniffing is only a legacy
 	// fallback. Global accounts never go through login (panel import).
 	sa.Auth.Region = lc.region
+	// issue #36（Part 2）：登录平台血统持久化——不写这一行，IDE 流程铸造的
+	// token 在聊天时会以 CLI 头族出现（platformForAuth 回退 CLI），token
+	// 血统与请求方言错配。遗留值保持原样（adopt 路径有自己的回填）。
+	sa.Auth.LoginPlatform = firstNonEmpty(lc.platform, "CLI")
 	// v0.9.44: persist the credential plugin-side BEFORE reporting success.
 	// The host saves the poll's Auth payload itself, but that save rides the
 	// login dialog's lifecycle — mimo hit the same failure class (v0.2.10:
@@ -277,11 +320,7 @@ var loginAcctRetryDelays = []time.Duration{400 * time.Millisecond, 800 * time.Mi
 // exchange, retrying transient failures. An empty-UID payload counts as a
 // failure — the caller decides whether to fall back or fail the login.
 func fetchLoginAccount(client *http.Client, region, state, accessToken string) (accountData, error) {
-	acctBase := endpointLoginAcct
-	if region == regionIntl {
-		acctBase = upstreamBaseForRegion(region) + "/v2/plugin/login/account?state="
-	}
-	return fetchLoginAccountAt(client, acctBase, region, state, accessToken)
+	return fetchLoginAccountAt(client, loginAccountBaseFor(region), region, state, accessToken)
 }
 
 // fetchLoginAccountAt is fetchLoginAccount against an explicit base URL

@@ -70,6 +70,11 @@ type cooldownReason string
 const (
 	cooldownReasonRateLimit cooldownReason = "rate_limit"
 	cooldownReasonUnknown   cooldownReason = "upstream_error"
+	// cooldownReasonDailyQuota（issue #35 补充分级，v0.9.58）：免费 0x 模型的
+	// 每日限额措辞 —— 每日额度的自然重置点是 UTC+8 零点，60s 的 unknown
+	// 窗口会让被限的 (账号, 模型) 对每分钟空转一次重试（最多 1440 次/天），
+	// 持有到午夜是诚实且自愈的窗口。
+	cooldownReasonDailyQuota cooldownReason = "daily_quota"
 )
 
 type modelCooldownKey struct {
@@ -116,6 +121,18 @@ func markModelCooldown(authID, model string, reason cooldownReason) {
 	if reason == cooldownReasonRateLimit {
 		ttl = modelCooldownRateLimit
 	}
+	markModelCooldownUntil(authID, model, reason, cooldownNowFn().Add(ttl))
+}
+
+// markModelCooldownUntil records (or re-arms) a hold with an explicit reset
+// instant (daily-quota tier). Shared never-shorten semantics with the TTL
+// variant above.
+func markModelCooldownUntil(authID, model string, reason cooldownReason, until time.Time) {
+	authID = strings.TrimSpace(authID)
+	model = strings.ToLower(strings.TrimSpace(model))
+	if authID == "" || model == "" || !until.After(cooldownNowFn()) {
+		return
+	}
 	now := cooldownNowFn()
 	cooldownMu.Lock()
 	cooldownSweepLocked(now)
@@ -132,13 +149,13 @@ func markModelCooldown(authID, model string, reason cooldownReason) {
 		delete(cooldownTable, oldestKey)
 	}
 	// Never shorten an active window: an earlier, larger hold stays.
-	if existing, ok := cooldownTable[modelCooldownKey{AuthID: authID, ModelID: model}]; ok && existing.Until.After(now.Add(ttl)) {
+	if existing, ok := cooldownTable[modelCooldownKey{AuthID: authID, ModelID: model}]; ok && existing.Until.After(until) {
 		cooldownMu.Unlock()
 		return
 	}
 	cooldownTable[modelCooldownKey{AuthID: authID, ModelID: model}] = modelCooldownEntry{
 		Reason:    reason,
-		Until:     now.Add(ttl),
+		Until:     until,
 		UpdatedAt: now,
 	}
 	cooldownMu.Unlock()
@@ -299,6 +316,17 @@ func recordUpstreamFailure(authID string, sa *storedAuth, model string, status i
 		markModelCooldown(authID, model, cooldownReasonRateLimit)
 		return
 	}
+	// Daily-allowance wording (issue #35 supplementary tier, v0.9.58): the
+	// natural reset is the next UTC+8 midnight. A declared reset instant in
+	// the payload ("将在 … 重置") wins when parsable.
+	if isDailyQuotaFrame(body) {
+		until, ok := parseRateLimitResetAt(body)
+		if !ok {
+			until = nextDailyResetUTC8(cooldownNowFn())
+		}
+		markModelCooldownUntil(authID, model, cooldownReasonDailyQuota, until)
+		return
+	}
 	// Empty streams and detected in-stream error frames (the 200-refused
 	// family, issue #35's exact shape) rotate the pair briefly. The body is
 	// the reliable discriminator — status may be 0 on both paths.
@@ -324,6 +352,78 @@ func isInStreamErrorFailure(body string) bool {
 	return strings.Contains(body, "workbuddy upstream error")
 }
 
+// dailyQuotaMarkers / dailyQuotaDayWords / dailyQuotaLimitWords（issue #35
+// 补充分级，v0.9.58）：免费 0x 模型每日限额的文案词族。帧形状至今无人
+// 捕获（报告者旧版无法提供、凭据轮换无法实测），所以设计为信封无关的
+// 保守匹配：组合词直接命中；拆分词族要求（每日/今日/daily 类）与
+// （上限/限额/exceed/limit 类）同时命中才算，避免误伤普通频率限制。
+// 6004 已在 recordUpstreamFailure 先判排除——它的重置措辞不是每日语义。
+var dailyQuotaMarkers = []string{
+	"daily limit",
+	"daily quota",
+	"daily usage",
+	"daily allowance",
+	"exceeded the daily",
+	"per-day limit",
+	"每日上限",
+	"每日限额",
+	"每日限制",
+	"每日用量",
+	"每日额度",
+	"今日上限",
+	"今日限额",
+	"今日额度",
+}
+
+var (
+	dailyQuotaDayWords   = []string{"daily", "每日", "今日", "当天"}
+	dailyQuotaLimitWords = []string{"limit", "quota", "exceed", "allowance", "上限", "限额", "限制", "超出", "超限", "额度", "用量"}
+)
+
+// isDailyQuotaFrame reports whether a failure body carries daily-allowance
+// semantics. 6004-shaped payloads are excluded (their own path owns those).
+func isDailyQuotaFrame(payload string) bool {
+	if strings.TrimSpace(payload) == "" {
+		return false
+	}
+	if isModelScopedRateLimit(http.StatusTooManyRequests, payload) {
+		return false
+	}
+	low := strings.ToLower(payload)
+	if containsAny(low, dailyQuotaMarkers...) {
+		return true
+	}
+	day, limit := false, false
+	for _, w := range dailyQuotaDayWords {
+		if strings.Contains(low, w) {
+			day = true
+			break
+		}
+	}
+	for _, w := range dailyQuotaLimitWords {
+		if strings.Contains(low, w) {
+			limit = true
+			break
+		}
+	}
+	return day && limit
+}
+
+// wbDailyZone is the fixed UTC+8 offset the upstream reset copy carries.
+var wbDailyZone = time.FixedZone("UTC+8", 8*60*60)
+
+// nextDailyResetUTC8 returns the next UTC+8 midnight — the natural reset
+// point of a daily allowance. Result is at most 24h out, so the hold can
+// never pin a pair beyond the day it was earned on.
+func nextDailyResetUTC8(now time.Time) time.Time {
+	cur := now.In(wbDailyZone)
+	midnight := time.Date(cur.Year(), cur.Month(), cur.Day(), 0, 0, 0, 0, wbDailyZone)
+	if !midnight.After(now) {
+		midnight = midnight.AddDate(0, 0, 1)
+	}
+	return midnight
+}
+
 // noteModelCooldownFailure is the failure-site hook used by the stream paths
 // (pump, collector tail, executor branches). authID may be "" when only the
 // stored auth is in scope; the resolver inside falls back to it.
@@ -347,7 +447,8 @@ func modelCooldownError(authID string, sa *storedAuth, model string) error {
 	if remaining < 1 {
 		remaining = 1
 	}
-	return &cooldownFastFailError{authID: authID, model: strings.TrimSpace(model), seconds: remaining, until: until}
+	reason, _ := cooldownReasonOf(authID, model)
+	return &cooldownFastFailError{authID: authID, model: strings.TrimSpace(model), seconds: remaining, until: until, reason: reason}
 }
 
 // cooldownFastFailError carries the fields for its message; kept as a type
@@ -357,13 +458,38 @@ type cooldownFastFailError struct {
 	model   string
 	seconds int
 	until   time.Time
+	reason  cooldownReason
 }
 
 func (e *cooldownFastFailError) Error() string {
+	if e.reason == cooldownReasonDailyQuota {
+		reset := e.until.In(wbDailyZone).Format("2006-01-02 15:04:05 UTC+8")
+		return "该模型今日免费额度已用完（上游每日限额）——仅此 (账号, 模型) 组合暂停，同账号其他模型与池内其他账号不受影响，将于 " + reset +
+			" 重置；期间调度器会自动改用其他候选，可切换其他模型或凭证继续。" +
+			" // This model hit the upstream daily allowance for today — only this (credential, model) pair is paused, other models and credentials are unaffected, resets at " + reset +
+			"; the scheduler rotates automatically meanwhile."
+	}
 	return "该 (账号, 模型) 对处于上游失败冷却中——仅此组合暂停约 " + strconv.Itoa(e.seconds) +
 		" 秒（至 " + e.until.UTC().Format(time.RFC3339) + "），同账号其他模型与池内其他账号不受影响；期间调度器会自动改用其他候选，无需更换凭证。" +
 		" // This (credential, model) pair is cooling after an upstream failure — paused for ~" + strconv.Itoa(e.seconds) +
 		"s, other models on the account and other credentials in the pool are unaffected; the scheduler rotates automatically meanwhile."
+}
+
+// cooldownReasonOf returns the active entry's reason for a pair (empty
+// string when not cooling) — the fast-fail copy is reason-aware.
+func cooldownReasonOf(authID, model string) (cooldownReason, bool) {
+	authID = strings.TrimSpace(authID)
+	model = strings.ToLower(strings.TrimSpace(model))
+	if authID == "" || model == "" {
+		return "", false
+	}
+	cooldownMu.Lock()
+	defer cooldownMu.Unlock()
+	entry, ok := cooldownTable[modelCooldownKey{AuthID: authID, ModelID: model}]
+	if !ok || !entry.Until.After(cooldownNowFn()) {
+		return "", false
+	}
+	return entry.Reason, true
 }
 
 // filterCoolingModels removes models currently cooling for THIS credential
@@ -417,4 +543,23 @@ func handleCooldownClear(req pluginapi.ManagementRequest) map[string]any {
 	}
 	removed := clearModelCooldown(authID, body.Model)
 	return map[string]any{"success": true, "removed": removed}
+}
+
+// dailyQuotaLimitCopy renders the bilingual daily-allowance copy for a raw
+// payload: a declared reset instant ("将在 … UTC+8 重置") wins, otherwise the
+// next UTC+8 midnight. Structurally identical to the 6004 copy but with
+// explicit "今日免费额度" semantics; like it, the text never carries the
+// literal "429" — hosts without the envelope status would re-read it from
+// the message alone as credential quota (issue #35).
+func dailyQuotaLimitCopy(payload string) string {
+	resetAt, ok := parseRateLimitResetAt(payload)
+	if !ok {
+		resetAt = nextDailyResetUTC8(time.Now())
+	}
+	return "该模型今日免费额度已用完（上游每日限额）——仅此模型受限，同一凭证其他模型不受影响，将于 " +
+		resetAt.In(wbDailyZone).Format("2006-01-02 15:04:05 UTC+8") +
+		" 重置；可切换其他模型或凭证继续。" +
+		" // This model hit the upstream daily allowance for today — other models on the same credential keep working, resets at " +
+		resetAt.In(wbDailyZone).Format("2006-01-02 15:04:05 UTC+8") +
+		"; switch model or credential meanwhile."
 }

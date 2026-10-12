@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.9.58
+
+### Daily-quota tier for the cooldown table + login platform lineage (issues #35/#36 follow-up)
+
+Two follow-ups on top of 0.9.57, both born from the same investigation
+round that produced v0.8.66:
+
+1. **Daily-allowance tier** (`cooldown.go`, issue #35): the 0.9.57
+   catch-all rotated a daily-limited (credential, model) pair for 60 s —
+   honest for never-captured wordings, but a *daily* limit re-arms that
+   hold every minute (up to 1440 wasted probes a day). Bodies carrying
+   daily-allowance semantics (`isDailyQuotaFrame`: combined markers like
+   "daily quota" / "每日上限" / "今日额度", or the dual word-family
+   每日/今日/daily × 上限/限额/exceed/limit, with 6004 excluded) now hold
+   until the natural reset point — the next UTC+8 midnight — and a
+   payload-declared reset instant ("将在 … 重置") still wins. The tier is
+   checked BEFORE the generic rate-limit branch (daily semantics are
+   strictly more specific), the fast-fail error copy is reason-aware
+   ("今日免费额度已用完 … 将于 <UTC+8 midnight> 重置"), and
+   `streamFaultStatus` maps daily frames to a 429-class status so
+   gate-enabled hosts cool them properly.
+
+2. **Login platform lineage** (`oauth.go`, issue #36 part 2): a login flow
+   minted through the IDE entry (`login_platform: ide`, or any intl login)
+   now persists `loginPlatform` into the auth file, so the token's
+   client-dialect lineage matches the header family its chats present.
+   Before this, an IDE-minted token presented CLI headers on chat — the
+   #26/#38 machine-header mismatch class mirrored on workbuddy. Existing
+   auth files keep whatever they carry (per-credential scoping is
+   unchanged: `login_region` / `login_platform` only seed NEW logins).
+
 ## 0.9.57
 
 ### Per-(credential, model) cooldown: a 200+refused stream now rotates the pool instead of pinning the session (issue #35)

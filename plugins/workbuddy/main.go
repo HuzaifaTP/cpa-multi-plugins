@@ -109,9 +109,15 @@ const (
 // CodeBuddy associates the browser login with the state issued at auth/state,
 // so we must reuse the same cookie jar across the state request and the polls.
 type loginCtx struct {
-	client  *http.Client
-	region  string // login realm: cn | intl (merged codebuddy-intl)
-	expires time.Time
+	client *http.Client
+	region string // login realm: cn | intl (merged codebuddy-intl)
+	// platform 记录该次登录实际使用的客户端平台（CLI/ide，issue #36）：
+	// Intl 入口只有 IDE 客户端，CN 入口跟 login_platform 配置。成功后写进
+	// sa.Auth.LoginPlatform，让 token 血统（哪个客户端族铸造）与后续聊天的
+	// 请求方言（头族）一致——不持久化的话 IDE 流程铸造的 token 会以 CLI
+	// 头族聊天，正是 #26/#38 类错配在 workbuddy 的镜像。
+	platform string
+	expires  time.Time
 }
 
 var (
@@ -342,7 +348,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.9.57"
+var version = "0.9.58"
 
 func wbRegistration() registration {
 	return registration{
