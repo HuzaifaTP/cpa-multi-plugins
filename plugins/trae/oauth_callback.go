@@ -311,6 +311,10 @@ func handleOAuthCallbackResource(req pluginapi.ManagementRequest) []byte {
 		// save paths (last-writer wins per field, GetUserInfo still wins).
 		if p.identity.UID != "" {
 			lc.cbUID = p.identity.UID
+			// v0.12.77: the callback revealed WHO is logging in —
+			// switch the login onto that account's derived device
+			// identity before any exchange point runs.
+			applyDerivedIdentityCN(lc, p.identity.UID)
 		}
 		if p.identity.Nickname != "" {
 			lc.cbNickname = p.identity.Nickname
@@ -349,6 +353,9 @@ func handleOAuthCallbackResource(req pluginapi.ManagementRequest) []byte {
 		// v0.12.25: intl parity — userInfo echo into the save path.
 		if p.identity.UID != "" {
 			lc.cbUID = p.identity.UID
+			// v0.12.77: per-account derived device identity (intl
+			// counterpart of the CN branch above).
+			applyDerivedIdentityIntl(lc, p.identity.UID)
 		}
 		if p.identity.Nickname != "" {
 			lc.cbNickname = p.identity.Nickname

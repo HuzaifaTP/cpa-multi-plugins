@@ -541,10 +541,10 @@ func intlhandleStartLogin(request []byte) ([]byte, error) {
 	}
 
 	// Step 5: Build verification URI with PKCE.
-	// v0.12.76: stable per-installation device identity (see main.go —
-	// ONE identity per install instead of one per login; the per-login
-	// minting burned server-side device slots until 403 code=20401
-	// Device limit reached locked accounts out, issue #38 余波).
+	// v0.12.76→v0.12.77: bootstrap device only — the URI is built before
+	// the account is known; the identity registered server-side is
+	// derived PER ACCOUNT at the callback (applyDerivedIdentityIntl,
+	// device_identity.go). See the main.go counterpart.
 	ident := ensureLoginDeviceIdentity(host.AuthDir, variantIntl)
 	deviceID, machineID := ident.DeviceID, ident.MachineID
 	verificationURI := intlbuildVerificationURI(loginHost, intlverificationURIParams{
@@ -1323,6 +1323,16 @@ func intlHandleCallbackConn(conn net.Conn, lc *intlloginCtx) bool {
 			lc.userTag = v
 			break
 		}
+	}
+
+	// userInfo echo (v0.12.77 parity with the resource-callback route +
+	// per-account derived device identity, see handleCallbackConn).
+	if id := parseCallbackIdentity(vals); id.UID != "" {
+		lc.cbUID = id.UID
+		if id.Nickname != "" {
+			lc.cbNickname = id.Nickname
+		}
+		applyDerivedIdentityIntl(lc, id.UID)
 	}
 
 	// Auth code (multiple names; first non-empty wins).

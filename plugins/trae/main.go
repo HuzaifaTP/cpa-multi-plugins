@@ -139,7 +139,7 @@ const (
 // version is injected at build time via -ldflags "-X main.version=...".
 // Keep the default in sync with the release tag: the shipped build.sh does
 // NOT inject it (only "-s -w"), so the plugin reports this literal value.
-var version = "0.12.76"
+var version = "0.12.77"
 
 var (
 	hostAPI *C.cliproxy_host_api
@@ -950,13 +950,13 @@ func startLoginWithVariant(request []byte, lv string) ([]byte, error) {
 	}
 
 	// Step 5: Build verification URI with PKCE challenge.
-	// v0.12.76: stable per-installation device identity — the official IDE
-	// reuses ONE identity per install; minting a fresh one per login
-	// registered a new server-side device every time and burned device
-	// slots until 403 code=20401 (Device limit reached) locked the
-	// account out of logging in (issue #38 余波). The key pair is part of
-	// that identity and is carried through the ctx/pending record so the
-	// exchange points reuse it instead of minting their own.
+	// v0.12.76→v0.12.77: this identity is now only the install's
+	// BOOTSTRAP device — a synthetic identity for the authorization-page
+	// URL, built before anyone knows which account is logging in. The
+	// identity that gets REGISTERED server-side is derived PER ACCOUNT at
+	// the callback (applyDerivedIdentityCN/Intl, see device_identity.go)
+	// from the userInfo echo; the exchange points then carry it through
+	// the ctx/pending record.
 	ident := ensureLoginDeviceIdentity(host.AuthDir, lv)
 	deviceID, machineID := ident.DeviceID, ident.MachineID
 	verificationURI := buildVerificationURI(loginHost, verificationURIParams{
@@ -1220,6 +1220,20 @@ func handleCallbackConn(conn netConn, lc *loginCtx) bool {
 		}
 	}
 
+	// userInfo echo (v0.12.77 parity with the resource-callback route,
+	// which has carried this since v0.12.25): the account's real
+	// UID/ScreenName. Besides the file-identity fallback, this is the
+	// trigger for the per-account DERIVED device identity — the local
+	// listener path used to miss it entirely, so listener logins never
+	// switched onto the account's own device.
+	if id := parseCallbackIdentity(vals); id.UID != "" {
+		lc.cbUID = id.UID
+		if id.Nickname != "" {
+			lc.cbNickname = id.Nickname
+		}
+		applyDerivedIdentityCN(lc, id.UID)
+	}
+
 	// Refresh token (use directly — skip ExchangeToken auth-code path).
 	for _, k := range []string{"refreshToken", "refresh_token", "RefreshToken", "refresh-token"} {
 		if v := vals.Get(k); v != "" {
@@ -1393,6 +1407,12 @@ func handlePollLogin(request []byte) ([]byte, error) {
 			Domain:       "trae.cn",
 			MachineID:    lc.machineID,
 			DeviceID:     lc.deviceID,
+			// v0.12.77: carry the login's device key pair (per-account
+			// derived when the callback echoed the uid) so the bound
+			// renewal signs as that device instead of falling to the
+			// legacy unbound path.
+			DevicePublicKey:  lc.devicePublicKey,
+			DevicePrivateKey: lc.devicePrivateKey,
 			// v0.12.60: refreshLocked 以谱系选 OAuth ClientID
 			// （solo → en1oxy7wnw8j9n）。裸 Auth 缺 variant 时一律解析成
 			// cn client，SOLO 登录当场就换发出跨类 token——ug/pay 族

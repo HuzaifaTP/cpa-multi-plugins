@@ -1,40 +1,48 @@
-// device_identity.go — v0.12.76: stable per-installation login device identity
-// （稳定设备身份：同一安装的每次登录复用同一台“设备”，不再每次铸新）.
+// device_identity.go — v0.12.77: per-ACCOUNT deterministic login device identity
+// （按账号派生的固定设备身份：每个账号一套永久稳定的设备指纹，账号间互不相同）.
 //
-// Root cause this file fixes (issue #38 余波, user-reported + live-verified):
-// every login used to mint a BRAND-NEW device identity — newDeviceID() +
-// newMachineID() at the login start, plus a fresh EC P-256 key pair at each
-// of the four exchange points. The server registers every distinct identity
-// as a separate device, so repeated logins (compounded by the v0.8.63
-// stuck-login retry era) burned one device slot per attempt until the
-// account hit
+// v0.12.76 shipped a stable PER-INSTALL identity (one device shared by every
+// account of a variant on this machine). User review rejected that shape:
+// multiple accounts of the same provider then present ONE server-side device
+// hopping between accounts — the exact fingerprint pattern upstream security
+// flags, and fundamentally the wrong model for a multi-account gateway.
 //
-//	ExchangeToken => HTTP 403 upstream code=20401 (Device limit reached.)
-//
-// and was locked out of logging in at all. The official IDE's contract is
-// ONE device identity per INSTALLATION: the same install reuses the same
-// deviceId/machineId/key pair for every login and every bound refresh.
-//
-// Resolution order (per normalized variant cn/solo/intl):
-//  1. the identity file <AuthDir>/.trae-device-identity-<variant>.json
-//     (same dir + dot-prefix + per-variant convention as
-//     .trae-pending-login.json, so the credential claim logic in adopt.go —
-//     which matches prefixes "trae-cn-"/"trae-solo-cn-"/"trae-intl-" — can
-//     never mistake it for a credential);
-//  2. seed from an existing credential in the same dir (trae-*.json): exact
-//     variant match preferred, newest mtime as the tiebreak — reconnects
-//     this install to the device slot its own earlier credential already
-//     registered server-side;
-//  3. mint a fresh identity and persist it for future logins.
-//
-// The EC P-256 key pair is persisted WITH the identity: it is part of the
-// device fingerprint the server binds (first exchange uploads the SPKI
-// public key), not a per-login secret. Identity persistence failures NEVER
-// fail the login — an in-memory identity still logs in (the pre-v0.12.76
-// behavior); it just cannot be reused by the next login.
+// v0.12.77 model (this file):
+//   - The identity that gets REGISTERED/BIND at ExchangeToken is DERIVED from
+//     the account: deriveAccountDeviceIdentity(variant, uid) is a pure
+//     function — deviceId (16 digits), machineId (UUID-v4 shaped) and the
+//     P-256 device key pair are all deterministic functions of
+//     (variant, uid). Same account → same device, on every login, on every
+//     install, forever (re-logins can never burn another device slot, which
+//     is what locked accounts out with 403 code=20401 "Device limit reached").
+//     Different accounts → different devices. A solo login of the same human
+//     gets its own device too (solo and cn are different server lineages —
+//     v0.12.60's cross-lineage poisoning).
+//   - The identity is known the moment the OAuth callback echoes userInfo
+//     (the account's uid — login_identity.go parses it, cockpit-tools
+//     TraeCallbackPayload.userInfo). The callback handlers therefore APPLY
+//     the derived identity to the login ctx before any exchange point runs.
+//     Server-side, the ExchangeToken DeviceInfo is what registers the device
+//     (live-proven 2026-10: the pre-v0.12.76 restore path presented a
+//     DIFFERENT identity than the authorization URL and the server happily
+//     registered it — the very behavior that piled devices up), so the
+//     authorization-URL params do not need to match.
+//   - What remains per-install is only the BOOTSTRAP identity
+//     (.trae-device-identity-<variant>.json): a synthetic device for the
+//     authorization-page URL, which is built BEFORE anyone knows which
+//     account is logging in. It is never bound to tokens, and it is NEVER
+//     adopted from a credential (v0.12.76 did seed it from credentials —
+//     that would put account A's device on account B's login page).
+//   - Callbacks without a userInfo echo (rare) keep the bootstrap identity
+//     for that login; the credential then carries it and refreshes reuse it.
+//     The account migrates to its derived identity at the next login that
+//     does echo the uid (the normal path).
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -93,55 +101,112 @@ func loadDeviceIdentity(authDir, variant string) *deviceIdentity {
 	return &id
 }
 
-// seedDeviceIdentityFromDir adopts the device identity of an existing
-// credential (trae-*.json) in authDir. Scoring: exact normalized-variant
-// match = 2, anything else = 1; equal scores break on the newest ModTime.
-// Files that fail auth.Parse (foreign/partial) are silently skipped. A nil
-// return means "nothing to inherit".
-func seedDeviceIdentityFromDir(authDir, variant string) *deviceIdentity {
-	nv := normalizeVariant(variant)
-	files, err := filepath.Glob(filepath.Join(authDir, "trae-*.json"))
-	if err != nil {
+// seedDeviceIdentityFromDir was v0.12.76's credential-adoption step.
+// v0.12.77 REMOVED it on purpose: the bootstrap identity must stay a
+// synthetic per-install device. Adopting an account credential's identity
+// would put account A's real device on account B's authorization page (and,
+// before the per-account derivation existed, converged every account onto
+// one shared device). Account identities now come exclusively from
+// deriveAccountDeviceIdentity; nothing here reads credentials anymore.
+
+// deriveAccountDeviceIdentity returns the deterministic device identity of
+// ONE account: a pure function of (normalized variant, uid). The same inputs
+// always yield the same deviceId / machineId / P-256 key pair — on this
+// install, on any install, on every login — so the server sees exactly one
+// stable device per account (the 20401 device-cap contract) and different
+// accounts never share a device. A blank uid returns nil (caller keeps the
+// bootstrap identity).
+func deriveAccountDeviceIdentity(variant, uid string) *deviceIdentity {
+	u := strings.TrimSpace(uid)
+	if u == "" {
 		return nil
 	}
-	var best *deviceIdentity
-	bestScore := 0
-	var bestMod time.Time
-	for _, f := range files {
-		raw, err := os.ReadFile(f)
-		if err != nil {
-			continue
-		}
-		a, err := auth.Parse(raw)
-		if err != nil {
-			continue // not one of our credentials — silently skip
-		}
-		if strings.TrimSpace(a.DeviceID) == "" || strings.TrimSpace(a.MachineID) == "" {
-			continue
-		}
-		score := 1
-		if normalizeVariant(a.Variant) == nv {
-			score = 2
-		}
-		var mod time.Time
-		if st, statErr := os.Stat(f); statErr == nil {
-			mod = st.ModTime()
-		}
-		if best != nil && (score < bestScore || (score == bestScore && !mod.After(bestMod))) {
-			continue
-		}
-		best = &deviceIdentity{
-			DeviceID:         a.DeviceID,
-			MachineID:        a.MachineID,
-			DevicePublicKey:  a.DevicePublicKey,
-			DevicePrivateKey: a.DevicePrivateKey,
-			Variant:          nv,
-			Source:           "seed:" + filepath.Base(f),
-		}
-		bestScore = score
-		bestMod = mod
+	nv := normalizeVariant(variant)
+	id := &deviceIdentity{
+		DeviceID:  derivedDeviceID(nv, u),
+		MachineID: derivedMachineID(nv, u),
+		Variant:   nv,
+		Source:    "derived:account",
+		CreatedAt: time.Now().Unix(),
 	}
-	return best
+	pub, priv, err := auth.DeterministicDeviceKeyPair(deriveSeed("device-key", nv, u))
+	if err != nil {
+		// Deterministic generation cannot realistically fail (no RNG,
+		// no IO); if it ever does, the ids still identify the device —
+		// the exchange point will surface the missing keys itself.
+		log.Printf("trae device identity: derive key pair for uid=%s variant=%s: %v", u, nv, err)
+		return id
+	}
+	id.DevicePublicKey, id.DevicePrivateKey = pub, priv
+	return id
+}
+
+// deriveAccountSeed labels the derivation inputs (domain separation: a
+// device id, a machine id and a key seed must never collide with each other
+// or across providers/versions).
+const deriveAccountSeedPrefix = "cpa-multi-plugins/trae/account-device/v1"
+
+func deriveSeed(label, variant, uid string) []byte {
+	return []byte(deriveAccountSeedPrefix + "\n" + label + "\n" + variant + "\n" + uid)
+}
+
+// derivedDeviceID maps the account into the upstream's device-id shape:
+// 16 decimal digits, first digit 1-9 (newDeviceID/randomDigits(16) shape;
+// cockpit-tools is_numeric_id(8, 24), real IDE ids are 16-19 digit snowflakes).
+func derivedDeviceID(variant, uid string) string {
+	sum := sha256.Sum256(deriveSeed("device-id", variant, uid))
+	n := binary.BigEndian.Uint64(sum[:8])
+	// [1e15, 1e16) → exactly 16 digits, first digit 1-9.
+	return fmt.Sprintf("%016d", 1_000_000_000_000_000+n%9_000_000_000_000_000)
+}
+
+// derivedMachineID maps the account into the machine-id shape the plugin
+// mints (newUUIDv4): a dashed UUID with the v4 version/variant bits set.
+func derivedMachineID(variant, uid string) string {
+	sum := sha256.Sum256(deriveSeed("machine-id", variant, uid))
+	b := make([]byte, 16)
+	copy(b, sum[:16])
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
+	s := hex.EncodeToString(b)
+	return s[0:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:32]
+}
+
+// applyDerivedIdentityCN swaps a cn/solo login ctx onto the account's
+// derived identity. Called the moment the callback reveals WHO is logging in
+// (userInfo echo) — before any exchange point, GetUserInfo call or credential
+// save reads the identity, so the whole downstream chain (exchange DeviceInfo,
+// saved credential, later bound refreshes) carries the account's own device.
+// Idempotent: the same uid always derives the same identity, so re-pasted
+// callbacks and redirect retries are harmless.
+func applyDerivedIdentityCN(lc *loginCtx, uid string) {
+	if lc == nil {
+		return
+	}
+	id := deriveAccountDeviceIdentity(lc.variant, uid)
+	if id == nil {
+		return
+	}
+	lc.deviceID, lc.machineID = id.DeviceID, id.MachineID
+	lc.devicePublicKey, lc.devicePrivateKey = id.DevicePublicKey, id.DevicePrivateKey
+	log.Printf("trae login: per-account device identity derived (uid=%s variant=%s deviceId=%s machineId=%s)",
+		strings.TrimSpace(uid), id.Variant, id.DeviceID, id.MachineID)
+}
+
+// applyDerivedIdentityIntl is the intl-flow counterpart of
+// applyDerivedIdentityCN.
+func applyDerivedIdentityIntl(lc *intlloginCtx, uid string) {
+	if lc == nil {
+		return
+	}
+	id := deriveAccountDeviceIdentity(variantIntl, uid)
+	if id == nil {
+		return
+	}
+	lc.deviceID, lc.machineID = id.DeviceID, id.MachineID
+	lc.devicePublicKey, lc.devicePrivateKey = id.DevicePublicKey, id.DevicePrivateKey
+	log.Printf("trae-intl login: per-account device identity derived (uid=%s deviceId=%s machineId=%s)",
+		strings.TrimSpace(uid), id.DeviceID, id.MachineID)
 }
 
 // persistDeviceIdentity writes the identity atomically (heal.go
@@ -201,9 +266,12 @@ func completeDeviceKeys(id *deviceIdentity) bool {
 	return true
 }
 
-// ensureLoginDeviceIdentity is the single entry point every login path uses
-// to resolve this installation's device identity for a variant. Resolution
-// order: identity file → seed from an existing credential → mint. It NEVER
+// ensureLoginDeviceIdentity resolves the installation's BOOTSTRAP identity
+// for a variant — the synthetic device the authorization-page URL carries
+// (the page is built before anyone knows which account is logging in; it is
+// never registered or bound server-side, see the file header). Resolution:
+// identity file → mint. v0.12.77: NO credential seeding — an account's real
+// identity must never leak into another account's login page. It NEVER
 // returns nil and never fails the login on persistence problems.
 func ensureLoginDeviceIdentity(authDir, variant string) *deviceIdentity {
 	deviceIdentityMu.Lock()
@@ -218,8 +286,7 @@ func ensureLoginDeviceIdentity(authDir, variant string) *deviceIdentity {
 	}
 	if dir == "" {
 		// Still nothing: an EPHEMERAL in-memory identity is strictly better
-		// than failing the login — it is exactly the pre-v0.12.76 behavior,
-		// just confined to this one login.
+		// than failing the login — it only decorates the login page URL.
 		return mintDeviceIdentity(nv)
 	}
 	if id := loadDeviceIdentity(dir, nv); id != nil {
@@ -230,13 +297,6 @@ func ensureLoginDeviceIdentity(authDir, variant string) *deviceIdentity {
 		if completeDeviceKeys(id) {
 			persistDeviceIdentityBestEffort(dir, id)
 		}
-		return id
-	}
-	if id := seedDeviceIdentityFromDir(dir, nv); id != nil {
-		completeDeviceKeys(id)
-		// 钉盘：继承来的身份必须落盘 —— 即使日后凭证被删除，本安装仍复用
-		// 同一设备位（20401 恢复承诺：直接重试即可成功）。
-		persistDeviceIdentityBestEffort(dir, id)
 		return id
 	}
 	id := mintDeviceIdentity(nv)

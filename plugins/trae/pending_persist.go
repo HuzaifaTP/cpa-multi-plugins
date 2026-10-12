@@ -380,6 +380,10 @@ func selfCompleteCN(lc *loginCtx, source string) {
 			Domain:       "trae.cn",
 			MachineID:    lc.machineID,
 			DeviceID:     lc.deviceID,
+			// v0.12.77: 携带登录设备密钥对（回调 echo 过 uid 时为按账号
+			// 派生身份），绑定续期以该设备签名，不再落回裸续期。
+			DevicePublicKey:  lc.devicePublicKey,
+			DevicePrivateKey: lc.devicePrivateKey,
 			// v0.12.60: 同 oauth_callback——refreshLocked 以谱系选 OAuth
 			// ClientID，裸 Auth 缺 variant 会把 SOLO 凭证换发成 cn 类。
 			Variant: lc.variant,

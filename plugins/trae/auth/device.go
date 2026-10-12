@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"math/big"
 )
 
 // GenerateDeviceKeyPair creates a fresh P-256 key pair and returns the public
@@ -32,6 +33,41 @@ func GenerateDeviceKeyPair() (publicKeyPEM, privateKeyPEM string, err error) {
 	if err != nil {
 		return "", "", fmt.Errorf("generate P-256 key: %w", err)
 	}
+	return marshalDeviceKeyPair(key)
+}
+
+// DeterministicDeviceKeyPair derives the SAME P-256 key pair from the SAME
+// seed every time (v0.12.77 per-account device identity): the seed — a plain
+// SHA-256 digest — is reduced into [1, n-1] as the private scalar and the
+// public point follows. Output shapes are byte-identical to
+// GenerateDeviceKeyPair (SPKI "PUBLIC KEY" + PKCS#8 "PRIVATE KEY" PEM), so
+// the server cannot tell a derived pair from a random one.
+//
+// The device key is not a secret in the threat model that matters: the
+// refresh token is what authenticates a renewal, and the identity file has
+// always carried the key pair in plaintext anyway. Determinism is the point —
+// the same account always presents the same device, on any install, forever,
+// which is exactly the contract the 20401 device-cap lockout demands.
+func DeterministicDeviceKeyPair(seed []byte) (publicKeyPEM, privateKeyPEM string, err error) {
+	if len(seed) == 0 {
+		return "", "", fmt.Errorf("device key seed is empty")
+	}
+	curve := elliptic.P256()
+	n := new(big.Int).Set(curve.Params().N)
+	d := new(big.Int).SetBytes(seed)
+	d.Mod(d, new(big.Int).Sub(n, big.NewInt(1)))
+	d.Add(d, big.NewInt(1)) // d ∈ [1, n-1]
+	key := &ecdsa.PrivateKey{
+		PublicKey: ecdsa.PublicKey{Curve: curve},
+		D:         d,
+	}
+	key.PublicKey.X, key.PublicKey.Y = curve.ScalarBaseMult(d.Bytes())
+	return marshalDeviceKeyPair(key)
+}
+
+// marshalDeviceKeyPair renders a P-256 pair in the wire shapes the upstream
+// expects (shared by the random and the deterministic generator).
+func marshalDeviceKeyPair(key *ecdsa.PrivateKey) (publicKeyPEM, privateKeyPEM string, err error) {
 	privDER, err := x509.MarshalPKCS8PrivateKey(key)
 	if err != nil {
 		return "", "", fmt.Errorf("marshal PKCS#8 private key: %w", err)
