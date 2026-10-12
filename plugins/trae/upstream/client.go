@@ -319,6 +319,12 @@ func (c *Client) refreshLocked(a *auth.Auth) error {
 		// 因为部分源只对特定账号域生效。
 	}
 	if lastErr != nil {
+		// v0.12.75: 根因分类学注释——20101/10101/20403 映射为用户可执行的恢复
+		// 动作（见 ExplainRefreshError）；%w 保持 errors.As/Is 链，Kind/BizCode
+		// 分类语义不变（pool 据此禁用）。
+		if hint := ExplainRefreshError(lastErr); hint != "" {
+			return fmt.Errorf("%w — %s", lastErr, hint)
+		}
 		return lastErr
 	}
 	var resp struct {
@@ -351,6 +357,36 @@ func (c *Client) refreshLocked(a *auth.Auth) error {
 		a.ExpiresAt = time.Now().Add(time.Duration(resp.Result.TokenExpireDuration) * time.Second).Unix()
 	}
 	return nil
+}
+
+// ExplainRefreshError 把一次刷新失败映射为面向用户的根因提示；错误不在
+// 已知分类学内时返回 ""（调用方保持原错误不动）。
+//
+// v0.12.75 错误分类学（2026-10-12 live 实证，trae_live_payfamily_test.go）：
+//   - http 401 code 20101 "refresh token is invalid" —— 死 rt（TRAE_OLD_RT
+//     腿实证）：同账号在别处刷新或登录后旧 refreshToken 即作废；
+//   - http 400 code 10101 "refresh token is not matched to the client" ——
+//     服务器在 ExchangeToken 交换层门禁 rt↔client 谱系（leg2 实证）；
+//   - http 401 code 20403 "Token device not match" —— 服务端绑定设备与
+//     本地 DeviceID/密钥不匹配（CheckLogin 副发现：绑定设备 kxrldxj552p5k6
+//     ≠ 凭据 deviceId）。
+//
+// Msg 是 doJSON 塞入的 body 片段；ResponseMetadata 嵌套信封为大写
+// "Code" 形状，宽容顶层小写 "code" 形状。nil 或非 *Error 返回 ""。
+func ExplainRefreshError(err error) string {
+	ue, ok := err.(*Error)
+	if !ok || ue == nil {
+		return ""
+	}
+	switch {
+	case strings.Contains(ue.Msg, `"Code":"20101"`) || strings.Contains(ue.Msg, `"code":20101`):
+		return "凭证链已在服务端失效（code 20101 refresh token invalid：同账号在别处刷新或登录后旧 refreshToken 即作废）——请在面板退出该账号并重新登录，或重新导入最新凭证"
+	case strings.Contains(ue.Msg, `"Code":"10101"`) || strings.Contains(ue.Msg, `"code":10101`):
+		return "refreshToken 与 OAuth client 谱系不匹配（code 10101）——auth 文件 variant 与签发 client 不符或 token 已被跨类交换污染，请重新登录"
+	case strings.Contains(ue.Msg, `"Code":"20403"`) || strings.Contains(ue.Msg, `"code":20403`):
+		return "设备绑定不匹配（code 20403 Token device not match）——服务端绑定设备与本地 DeviceID/密钥不一致，绑定续期不可用；如签到持续 9074 请重新登录以重绑设备"
+	}
+	return ""
 }
 
 // normalizeExpiresAt 把 ExchangeToken 的 TokenExpireAt 归一化为 Unix 秒。

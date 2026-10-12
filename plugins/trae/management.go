@@ -962,6 +962,9 @@ func refreshAccountCredits(f pluginapi.HostAuthFileEntry, sa *storedAuth, a *aut
 	usage, err := upstreamClient.UserEntUsage(a)
 	if err != nil {
 		entry["error"] = "ent_usage: " + err.Error()
+		// v0.12.75: pay 族 401 code 1001 是 access token 过期/失效的下游症状，
+		// 面板此前误导性地只显示 "ent_usage: upstream session_dead"。
+		annotateStaleToken(entry, err, a.ExpiresAt, time.Now().Unix())
 		return entry
 	}
 	sum, plan, selected := summarizeEntUsage(usage, true)
@@ -1019,6 +1022,29 @@ func refreshAccountCredits(f pluginapi.HostAuthFileEntry, sa *storedAuth, a *aut
 	}
 	// Shared tail: entry projection + cache/pool snapshot (pool-eligible).
 	return finalizeAccountCredits(f, sa, entry, sum, plan, bind, wallet, checkedIn, enable, true)
+}
+
+// annotateStaleToken flags a credits-query failure whose real root cause is
+// an expired access token: when the error carries the session_dead
+// signature AND the token's ExpiresAt is already in the past, the entry's
+// error gains an actionable suffix and a token_expired=true machine-readable
+// marker (v0.12.75 — pay 族 401 code 1001 是 access token 过期/失效的
+// 下游症状，面板此前误导性地只显示 "ent_usage: upstream session_dead"，
+// 2026-10-12 live 实测定案). Pure function — mutates entry only.
+func annotateStaleToken(entry map[string]any, err error, expiresAt, now int64) {
+	if err == nil || now <= expiresAt {
+		return
+	}
+	if !strings.Contains(err.Error(), "session_dead") {
+		return
+	}
+	const suffix = "（access token 已过期——请先点顶部「刷新」；若 refresh 报 code 20101 则凭证链已被服务端轮换，需退出账号重新登录）"
+	if prev, ok := entry["error"].(string); ok && prev != "" {
+		entry["error"] = prev + suffix
+	} else {
+		entry["error"] = suffix
+	}
+	entry["token_expired"] = true
 }
 
 // summarizeEntUsage builds the panel/cache usage summary, plan label and
@@ -1156,6 +1182,9 @@ func refreshAccountCreditsIntl(f pluginapi.HostAuthFileEntry, sa *storedAuth, en
 	usageResp, err := intlEntUsage(sa.Auth.AccessToken, sa.Auth.Region, deviceID)
 	if err != nil {
 		entry["error"] = "intl ent_usage: " + err.Error()
+		// v0.12.75: 与 CN 路径同一把尺——过期 token 的 session_dead 失败附上
+		// 先刷新/需重登的指引与 token_expired 标记。
+		annotateStaleToken(entry, err, sa.Auth.ExpiresAt, time.Now().Unix())
 		return entry
 	}
 	usage := usageResp.toCNResult()

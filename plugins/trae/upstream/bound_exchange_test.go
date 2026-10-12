@@ -1,11 +1,11 @@
-// bound_exchange_test.go pins the v0.12.74 device-bound token renewal,
-// byte-aligned with the production-verified magpie-community reference
-// (magpie-community/packages/trae index.mjs boundExchange/proofOf/deviceInfo,
-// 行号区间 446-504): the SOLO_PC-first identity ladder with per-identity
+// bound_exchange_test.go pins the device-bound token renewal (v0.12.74
+// magpie 对齐, v0.12.75 谱系感知): the lineage-aware identity ladder
+// (own-lineage rung first — the server gates rt↔client lineage at the
+// ExchangeToken layer, 2026-10-12 live-verified code 10101), per-identity
 // versions, the Cloud-IDE-JWT Authorization header, the magpie DeviceInfo
-// value domain, the single api.trae.cn host (no fan-out), bound-first
-// ordering in refreshLocked, and the legacy-path fallback when the bound
-// renewal is refused on both identities.
+// value domain, the single api.trae.cn host (no fan-out), the 20403
+// device-bind short-circuit, bound-first ordering in refreshLocked, and the
+// legacy-path fallback when the bound renewal is refused on both identities.
 package upstream
 
 import (
@@ -74,20 +74,42 @@ func TestSignDeviceProofVerifiesWithPublicKey(t *testing.T) {
 	}
 }
 
-// TestBoundExchangeIdentitiesMagpieOrder: v0.12.74 magpie 对齐——固定身份
-// 梯子替代 v0.12.73 的 own-lineage 优先（旧行为的断言已随语义迁移到这里）：
-// SOLO_PC(en1oxy7wnw8j9n, 0.1.64) 永远第一（qilimixingkong/trae-checkin
-// 发现服务器接受的那个），IDE_PC(ono9krqynydwx5, 3.3.99) 第二。
-func TestBoundExchangeIdentitiesMagpieOrder(t *testing.T) {
-	ids := boundExchangeIdentities()
-	if len(ids) != 2 {
-		t.Fatalf("identity ladder = %+v, want exactly 2 rungs", ids)
+// TestBoundExchangeIdentitiesLineageAware: v0.12.75 谱系感知梯子。服务器在
+// ExchangeToken 交换层门禁 rt↔client 谱系（2026-10-12 live 实证：cn rt 用
+// SOLO client en1oxy7wnw8j9n 交换 → http 400 code 10101 "refresh token is
+// not matched to the client"），own-lineage rung 是唯一可能成功的 rung，
+// 必须第一。cn/空/intl/未知 → IDE_PC 第一；solo/solo-intl/"  SOLO  "
+// （IsSoloVariant 大小写空白容忍）→ SOLO_PC 第一。另一 rung 保留为
+// variant 错标时的自愈兜底。
+func TestBoundExchangeIdentitiesLineageAware(t *testing.T) {
+	solo := exchangeIdentity{ClientID: soloExchangeClient, PlatformCode: "SOLO_PC", Version: soloExchangeVersion}
+	ide := exchangeIdentity{ClientID: ideExchangeClient, PlatformCode: "IDE_PC", Version: ideExchangeVersion}
+	cases := []struct {
+		variant string
+		first   exchangeIdentity
+		second  exchangeIdentity
+	}{
+		// cn/空/未知 → 解析为 cn 谱系（与 ClientIDFor 一致）→ IDE_PC 第一。
+		{"cn", ide, solo},
+		{"", ide, solo},
+		{"intl", ide, solo}, // intl 同为 non-solo client id
+		{"mystery-lineage", ide, solo},
+		// solo 谱系 → SOLO_PC 第一。
+		{"solo", solo, ide},
+		{"solo-intl", solo, ide},
+		{"  SOLO  ", solo, ide}, // IsSoloVariant 内置归一化
 	}
-	if ids[0].ClientID != soloExchangeClient || ids[0].PlatformCode != "SOLO_PC" || ids[0].Version != "0.1.64" {
-		t.Errorf("first identity = %+v, want SOLO_PC en1oxy7wnw8j9n 0.1.64", ids[0])
-	}
-	if ids[1].ClientID != ideExchangeClient || ids[1].PlatformCode != "IDE_PC" || ids[1].Version != "3.3.99" {
-		t.Errorf("second identity = %+v, want IDE_PC ono9krqynydwx5 3.3.99", ids[1])
+	for _, tc := range cases {
+		ids := boundExchangeIdentities(tc.variant)
+		if len(ids) != 2 {
+			t.Fatalf("variant %q: identity ladder = %+v, want exactly 2 rungs", tc.variant, ids)
+		}
+		if ids[0] != tc.first {
+			t.Errorf("variant %q: first identity = %+v, want %+v (own lineage first — the other order burns a guaranteed-dead 10101 attempt)", tc.variant, ids[0], tc.first)
+		}
+		if ids[1] != tc.second {
+			t.Errorf("variant %q: second identity = %+v, want %+v (kept as the mislabeled-variant self-heal rung)", tc.variant, ids[1], tc.second)
+		}
 	}
 }
 
@@ -100,18 +122,21 @@ func TestBoundExchangeHostDefaultIsMagpieAuthHost(t *testing.T) {
 	}
 }
 
-// TestRefreshLockedBoundExchangeMagpieLadder drives a REAL httptest server
-// (boundExchangeHost injected) through c.RefreshToken: the first request must
-// carry the SOLO identity, the second (after a 400 refusal) the IDE identity,
-// and the IDE run's tokens win. Also pins: the Cloud-IDE-JWT Authorization
-// header, the magpie DeviceInfo value domain, the single-host strategy (the
-// account's apiHost / the client's OAuthHost are never contacted), and the
-// refresh-token rotation respect.
-func TestRefreshLockedBoundExchangeMagpieLadder(t *testing.T) {
+// TestRefreshLockedBoundExchangeLineageLadder drives a REAL httptest server
+// (boundExchangeHost injected) through c.RefreshToken for a cn account: the
+// first request must carry the IDE identity (v0.12.75 own-lineage first —
+// the server's rt↔client lineage gate, live-verified 2026-10-12, answers the
+// SOLO client with 400 code 10101), the second (after that refusal) the SOLO
+// identity, and after both refusals the legacy /cloudide path renews. Also
+// pins: the Cloud-IDE-JWT Authorization header, the magpie DeviceInfo value
+// domain, the single-host strategy (the client's OAuthHost canary is never
+// contacted), the proof shape, and the refresh-token rotation respect.
+func TestRefreshLockedBoundExchangeLineageLadder(t *testing.T) {
 	var mu sync.Mutex
 	var bodies []map[string]any
 	var auths []string
 	var paths []string
+	legacyHits := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		var body map[string]any
@@ -122,16 +147,23 @@ func TestRefreshLockedBoundExchangeMagpieLadder(t *testing.T) {
 		bodies = append(bodies, body)
 		auths = append(auths, r.Header.Get("Authorization"))
 		paths = append(paths, r.URL.Path)
-		n := len(bodies)
 		mu.Unlock()
-		if n == 1 {
-			// SOLO run refused — e.g. a token the server does not match to
-			// that client (issue #38's 400 family).
+		if r.URL.Path == epExchangeBound {
+			// Both bound rungs refused — the live-verified 10101 lineage-gate
+			// shape (http 400, flat lowercase code).
 			w.WriteHeader(http.StatusBadRequest)
 			fmt.Fprint(w, `{"code":10101,"message":"refresh token is not matched to the client"}`)
 			return
 		}
-		fmt.Fprint(w, `{"Result":{"Token":"bound-token","RefreshToken":"rotated-rt","TokenExpireAt":1790000000000}}`)
+		if !strings.HasSuffix(r.URL.Path, EpExchange) {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			return
+		}
+		// Legacy /cloudide renewal (the account's apiHost, same server).
+		mu.Lock()
+		legacyHits++
+		mu.Unlock()
+		fmt.Fprint(w, `{"Result":{"Token":"legacy-token","RefreshToken":"legacy-rt","TokenExpireAt":1790000000000}}`)
 	}))
 	defer ts.Close()
 
@@ -139,11 +171,13 @@ func TestRefreshLockedBoundExchangeMagpieLadder(t *testing.T) {
 	boundExchangeHost = ts.URL
 	t.Cleanup(func() { boundExchangeHost = prevHost })
 
-	// Deliberately DIFFERENT api/OAuth hosts: the v0.12.73 fan-out would have
-	// contacted them after a refusal — a single-host strategy must not.
+	// a.APIHost is the legacy path's primary source (this server); the
+	// client's OAuthHost stays a canary — the v0.12.73 fan-out would have
+	// contacted it after a refusal; neither the bound path nor the legacy
+	// first source may.
 	c := &Client{HTTP: ts.Client(), OAuthHost: "https://oauth-fanout-canary.example"}
 	a := &auth.Auth{AccessToken: "live-jwt", RefreshToken: "oldrt", ExpiresAt: 1,
-		APIHost: "https://apihost-fanout-canary.example", Variant: "cn",
+		APIHost: ts.URL, Variant: "cn",
 		DeviceID: "1111222233334444", MachineID: "machine-1"}
 	if err := c.RefreshToken(a); err != nil {
 		t.Fatalf("refresh: %v", err)
@@ -151,34 +185,36 @@ func TestRefreshLockedBoundExchangeMagpieLadder(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(bodies) != 2 {
-		t.Fatalf("requests = %d, want exactly 2 (SOLO refusal then IDE success — no host fan-out)", len(bodies))
+	if len(bodies) != 3 || legacyHits != 1 {
+		t.Fatalf("requests = %d (legacy hits %d), want exactly 2 bound rungs + 1 legacy renewal — no host fan-out", len(bodies), legacyHits)
 	}
-	// ① 身份梯子顺序与各自身份的版本号（ClientVersion 与 IDEVersion 同值）。
-	first, second := bodies[0], bodies[1]
-	if first["ClientID"] != soloExchangeClient || first["IDEVersion"] != "0.1.64" {
-		t.Errorf("first request ClientID/IDEVersion = %v/%v, want en1oxy7wnw8j9n/0.1.64", first["ClientID"], first["IDEVersion"])
+	bound := bodies[:2]
+	// ① 谱系梯子顺序与各身份的版本号（ClientVersion 与 IDEVersion 同值）：
+	// cn 账号 own-lineage IDE_PC 第一，SOLO_PC 只作 variant 错标自愈兜底。
+	first, second := bound[0], bound[1]
+	if first["ClientID"] != ideExchangeClient || first["IDEVersion"] != "3.3.99" {
+		t.Errorf("first request ClientID/IDEVersion = %v/%v, want ono9krqynydwx5/3.3.99", first["ClientID"], first["IDEVersion"])
 	}
 	di1, ok := first["DeviceInfo"].(map[string]any)
 	if !ok {
 		t.Fatal("first DeviceInfo missing")
 	}
-	if di1["PlatformCode"] != "SOLO_PC" || di1["ClientVersion"] != "0.1.64" {
-		t.Errorf("first DeviceInfo = %v, want SOLO_PC + ClientVersion 0.1.64", di1)
+	if di1["PlatformCode"] != "IDE_PC" || di1["ClientVersion"] != "3.3.99" {
+		t.Errorf("first DeviceInfo = %v, want IDE_PC + ClientVersion 3.3.99", di1)
 	}
-	if second["ClientID"] != ideExchangeClient || second["IDEVersion"] != "3.3.99" {
-		t.Errorf("second request ClientID/IDEVersion = %v/%v, want ono9krqynydwx5/3.3.99", second["ClientID"], second["IDEVersion"])
+	if second["ClientID"] != soloExchangeClient || second["IDEVersion"] != "0.1.64" {
+		t.Errorf("second request ClientID/IDEVersion = %v/%v, want en1oxy7wnw8j9n/0.1.64", second["ClientID"], second["IDEVersion"])
 	}
 	di2, ok := second["DeviceInfo"].(map[string]any)
 	if !ok {
 		t.Fatal("second DeviceInfo missing")
 	}
-	if di2["PlatformCode"] != "IDE_PC" || di2["ClientVersion"] != "3.3.99" {
-		t.Errorf("second DeviceInfo = %v, want IDE_PC + ClientVersion 3.3.99", di2)
+	if di2["PlatformCode"] != "SOLO_PC" || di2["ClientVersion"] != "0.1.64" {
+		t.Errorf("second DeviceInfo = %v, want SOLO_PC + ClientVersion 0.1.64", di2)
 	}
 	// ② magpie boundExchange 带 Authorization: Cloud-IDE-JWT <token>。
 	if auths[0] != "Cloud-IDE-JWT live-jwt" || auths[1] != "Cloud-IDE-JWT live-jwt" {
-		t.Errorf("Authorization headers = %v, want Cloud-IDE-JWT live-jwt on every request", auths)
+		t.Errorf("Authorization headers = %v, want Cloud-IDE-JWT live-jwt on every bound request", auths)
 	}
 	// ③ magpie DeviceInfo 值域（v0.12.73 偏差逐项纠正）。
 	for _, di := range []map[string]any{di1, di2} {
@@ -201,18 +237,23 @@ func TestRefreshLockedBoundExchangeMagpieLadder(t *testing.T) {
 			t.Errorf("DeviceInfo device identity wrong: %v", di)
 		}
 	}
-	// ④ 单 host：所有请求都打注入的 boundExchangeHost 的 ExchangeToken 路径。
-	for i, p := range paths {
+	// ④ 单 host：绑定路径只打注入的 boundExchangeHost；legacy 恰好一次走账号
+	// apiHost 的 /cloudide EpExchange（同一 server，路径可区分），OAuthHost
+	// canary 从未被联系。
+	for i, p := range paths[:2] {
 		if p != epExchangeBound {
-			t.Errorf("request %d path = %q, want %q", i, p, epExchangeBound)
+			t.Errorf("bound request %d path = %q, want %q", i, p, epExchangeBound)
 		}
 	}
-	// ⑥ 成功响应解析 + refresh token 轮换尊重（返回了就采用）。
-	if a.AccessToken != "bound-token" {
-		t.Errorf("AccessToken = %q, want bound-token", a.AccessToken)
+	if paths[2] != EpExchange {
+		t.Errorf("legacy request path = %q, want %q", paths[2], EpExchange)
 	}
-	if a.RefreshToken != "rotated-rt" {
-		t.Errorf("RefreshToken = %q, want the rotated rt (a returned one is honored)", a.RefreshToken)
+	// ⑥ legacy 兜底成功 + refresh token 轮换尊重（返回了就采用）。
+	if a.AccessToken != "legacy-token" {
+		t.Errorf("AccessToken = %q, want legacy-token", a.AccessToken)
+	}
+	if a.RefreshToken != "legacy-rt" {
+		t.Errorf("RefreshToken = %q, want the rotated legacy rt (a returned one is honored)", a.RefreshToken)
 	}
 	if exp := a.ExpiresAt; exp != 1790000000 {
 		t.Errorf("ExpiresAt = %d, want ms-normalized 1790000000", exp)
@@ -221,8 +262,8 @@ func TestRefreshLockedBoundExchangeMagpieLadder(t *testing.T) {
 	if a.DevicePublicKey == "" || a.DevicePrivateKey == "" {
 		t.Error("device key pair not generated/attached")
 	}
-	// proof shape on both requests
-	for i, body := range bodies {
+	// proof shape on both bound requests
+	for i, body := range bound {
 		proof, ok := body["DeviceProof"].(map[string]any)
 		if !ok {
 			t.Fatalf("request %d DeviceProof missing", i)
@@ -270,21 +311,24 @@ func TestBoundExchangeNoAuthorizationWithoutToken(t *testing.T) {
 	if authHeader != "" {
 		t.Errorf("Authorization = %q, want absent for a token-less account", authHeader)
 	}
-	if body["ClientID"] != soloExchangeClient {
-		t.Errorf("ClientID = %v, want the SOLO rung even without an access token", body["ClientID"])
+	if body["ClientID"] != ideExchangeClient {
+		t.Errorf("ClientID = %v, want the IDE rung (cn lineage first) even without an access token", body["ClientID"])
 	}
 }
 
 // TestRefreshLockedBoundFallsBackToLegacy: both identities refused (400,
 // e.g. cross-lineage mismatch on the whole ladder) → the bound path yields an
 // error and the legacy /cloudide path still renews; never worse than before.
-// v0.12.74: the ladder is exactly 2 attempts (SOLO then IDE) — no host
-// fan-out on top.
+// v0.12.75: the ladder is exactly 2 attempts (IDE_PC then SOLO_PC for a cn
+// account — own lineage first) — no host fan-out on top.
 func TestRefreshLockedBoundFallsBackToLegacy(t *testing.T) {
-	boundHits := 0
+	var boundClients []string
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path == epExchangeBound {
-			boundHits++
+			raw, _ := io.ReadAll(r.Body)
+			var body map[string]any
+			_ = json.Unmarshal(raw, &body)
+			boundClients = append(boundClients, fmt.Sprintf("%v", body["ClientID"]))
 			return jsonResp(400, `{"code":10101,"message":"refresh token is not matched to the client"}`), nil
 		}
 		if strings.HasSuffix(r.URL.Path, EpExchange) {
@@ -296,8 +340,11 @@ func TestRefreshLockedBoundFallsBackToLegacy(t *testing.T) {
 	if err := c.RefreshToken(a); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
-	if boundHits != 2 {
-		t.Fatalf("bound attempts = %d, want exactly 2 (the magpie ladder, no host fan-out)", boundHits)
+	if len(boundClients) != 2 {
+		t.Fatalf("bound attempts = %d, want exactly 2 (the lineage ladder, no host fan-out)", len(boundClients))
+	}
+	if boundClients[0] != ideExchangeClient || boundClients[1] != soloExchangeClient {
+		t.Errorf("bound ladder = %v, want [%s %s] (own lineage first)", boundClients, ideExchangeClient, soloExchangeClient)
 	}
 	if a.AccessToken != "legacy-token" || a.RefreshToken != "legacy-rt" {
 		t.Errorf("fallback tokens wrong: %q / %q", a.AccessToken, a.RefreshToken)
@@ -306,5 +353,55 @@ func TestRefreshLockedBoundFallsBackToLegacy(t *testing.T) {
 	// server will eventually bind), ready for SaveAtomic persistence
 	if a.DevicePublicKey == "" || a.DevicePrivateKey == "" {
 		t.Error("generated device keys were not kept after fallback")
+	}
+}
+
+// TestBoundExchangeDeviceMismatchShortCircuit: v0.12.75 —— 首 rung 被
+// 401 code 20403 "Token device not match" 拒（2026-10-12 live 实证：服务器
+// 绑定设备与 DeviceInfo 不匹配即 20403，与 client 谱系无关）时梯子必须
+// 短路：两个 rung 呈同一 DeviceInfo、同一密钥签名，次 rung 必败，继续
+// 尝试只会多烧一次失败 proof（issue #38 服务端安全层教训）。cn 账号首
+// rung IDE_PC、solo 账号首 rung SOLO_PC，两条谱系同样短路，legacy 兜底
+// 照常成功。
+func TestBoundExchangeDeviceMismatchShortCircuit(t *testing.T) {
+	const mismatch = `{"ResponseMetadata":{"Error":{"Code":"20403","Message":"Token device not match."}},"Result":null}`
+	cases := []struct {
+		name        string
+		variant     string
+		firstRungID string
+	}{
+		{"cn first rung IDE_PC", "cn", ideExchangeClient},
+		{"solo first rung SOLO_PC", "solo", soloExchangeClient},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var boundClients []string
+			c := testClient(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == epExchangeBound {
+					raw, _ := io.ReadAll(r.Body)
+					var body map[string]any
+					_ = json.Unmarshal(raw, &body)
+					boundClients = append(boundClients, fmt.Sprintf("%v", body["ClientID"]))
+					return jsonResp(http.StatusUnauthorized, mismatch), nil
+				}
+				if strings.HasSuffix(r.URL.Path, EpExchange) {
+					return jsonResp(200, `{"Result":{"Token":"legacy-token","RefreshToken":"legacy-rt"}}`), nil
+				}
+				return nil, errors.New("unexpected path " + r.URL.Path)
+			})
+			a := &auth.Auth{AccessToken: "at", RefreshToken: "oldrt", ExpiresAt: 1, APIHost: "https://oauth.example", Variant: tc.variant, DeviceID: "1111222233334444"}
+			if err := c.RefreshToken(a); err != nil {
+				t.Fatalf("refresh: %v", err)
+			}
+			if len(boundClients) != 1 {
+				t.Fatalf("bound attempts = %d, want exactly 1 (20403 short-circuits the ladder — the next rung re-sends the same DeviceInfo signed by the same key and cannot succeed)", len(boundClients))
+			}
+			if boundClients[0] != tc.firstRungID {
+				t.Errorf("refused rung ClientID = %v, want %s (own lineage first)", boundClients[0], tc.firstRungID)
+			}
+			if a.AccessToken != "legacy-token" || a.RefreshToken != "legacy-rt" {
+				t.Errorf("legacy fallback tokens wrong: %q / %q", a.AccessToken, a.RefreshToken)
+			}
+		})
 	}
 }

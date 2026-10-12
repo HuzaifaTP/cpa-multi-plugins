@@ -85,7 +85,7 @@ func TestLiveRefreshAndChat(t *testing.T) {
 				"accessToken": a.AccessToken, "refreshToken": a.RefreshToken,
 				"expiresAt": a.ExpiresAt, "domain": a.Domain, "apiHost": a.APIHost,
 				"machineId": a.MachineID, "deviceId": a.DeviceID,
-				"variant": a.Variant,
+				"variant":         a.Variant,
 				"devicePublicKey": a.DevicePublicKey, "devicePrivateKey": a.DevicePrivateKey,
 			},
 		}

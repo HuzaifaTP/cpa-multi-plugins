@@ -30,11 +30,13 @@
 // the production-verified magpie-community reference
 // (magpie-community/packages/trae index.mjs SITES["trae-cn"].deviceExchange
 // 与 boundExchange/proofOf/deviceInfo, 行号区间 446-504):
-//   - identities: SOLO_PC (en1oxy7wnw8j9n, 0.1.64) FIRST — the one
-//     qilimixingkong/trae-checkin found the server takes — then IDE_PC
+//   - identities (v0.12.75 谱系感知): own-lineage rung first — solo 谱系
+//     SOLO_PC (en1oxy7wnw8j9n, 0.1.64), cn/intl/空/未知谱系 IDE_PC
 //     (ono9krqynydwx5, 3.3.99); each identity carries ITS OWN version in
 //     ClientVersion/IDEVersion (v0.12.73 paired the SOLO version with the
-//     IDE_PC platform for cn-lineage tokens — self-contradictory);
+//     IDE_PC platform for cn-lineage tokens — self-contradictory). v0.12.74
+//     的 SOLO_PC 永远第一已被 2026-10-12 live 实证推翻：服务器在交换层
+//     10101 门禁 rt↔client 谱系，cn 账号每刷新都白烧一次必败尝试；
 //   - single host api.trae.cn (site.hosts.auth): the v0.12.73 multi-source
 //     fan-out (apiHost → OAuthHost → backup) produced up to 4-6 failed proof
 //     attempts per refresh on the bound path, and the repeated device/client
@@ -69,8 +71,8 @@ import (
 const epExchangeBound = "/trae/api/v3/oauth/ExchangeToken"
 
 // magpie-community/packages/trae index.mjs SITES["trae-cn"].deviceExchange.as
-// —— 逐项照抄（生产验证可用）：SOLO 身份优先（"qilimixingkong/trae-checkin
-// 发现服务器接受的那个"），IDE 身份第二；每个身份带自己的版本号。
+// —— 身份与版本号逐项照抄（生产验证可用）；v0.12.75 起梯子顺序谱系感知
+// （own-lineage 优先，见 boundExchangeIdentities），不再固定 SOLO 优先。
 const (
 	soloExchangeClient  = "en1oxy7wnw8j9n" // TRAE SOLO CN
 	soloExchangeVersion = "0.1.64"
@@ -99,16 +101,30 @@ type exchangeIdentity struct {
 	Version      string
 }
 
-// boundExchangeIdentities returns the renewal identity ladder, magpie order:
-// SOLO_PC first (the identity the server takes, per
-// qilimixingkong/trae-checkin), then the Trae CN IDE. Variant-INDEPENDENT
-// by design — v0.12.73's own-lineage-first ladder is retired with the
-// alignment (the magpie reference runs the same ladder for every account).
-func boundExchangeIdentities() []exchangeIdentity {
-	return []exchangeIdentity{
-		{ClientID: soloExchangeClient, PlatformCode: "SOLO_PC", Version: soloExchangeVersion},
-		{ClientID: ideExchangeClient, PlatformCode: "IDE_PC", Version: ideExchangeVersion},
+// boundExchangeIdentities returns the lineage-aware renewal identity
+// ladder: the account's own-lineage rung first, the other lineage second.
+//
+// v0.12.75 (2026-10-12 live 实证, trae_live_payfamily_test.go leg2): the
+// server gates rt↔client lineage AT the ExchangeToken layer — a cn-lineage
+// rt exchanged as the SOLO client (en1oxy7wnw8j9n) is refused with
+// http 400 code 10101 "refresh token is not matched to the client". The
+// v0.12.74 magpie-aligned fixed ladder (SOLO_PC first for every account)
+// therefore burned one guaranteed-dead attempt on every cn refresh. The
+// own-lineage rung is the only rung that can succeed; the other lineage is
+// kept as a self-heal fallback for a mislabeled variant — if the auth
+// file's variant is wrong, the own-lineage rung 10101s and the other
+// rung may still go through.
+//
+// Lineage resolution mirrors ClientIDFor exactly (empty/unknown → cn):
+// IsSoloVariant ("solo"/"solo-intl", case/whitespace tolerant) → SOLO_PC
+// first; everything else (cn/intl/empty/unknown) → IDE_PC first.
+func boundExchangeIdentities(variant string) []exchangeIdentity {
+	solo := exchangeIdentity{ClientID: soloExchangeClient, PlatformCode: "SOLO_PC", Version: soloExchangeVersion}
+	ide := exchangeIdentity{ClientID: ideExchangeClient, PlatformCode: "IDE_PC", Version: ideExchangeVersion}
+	if IsSoloVariant(variant) {
+		return []exchangeIdentity{solo, ide}
 	}
+	return []exchangeIdentity{ide, solo}
 }
 
 // deviceProofPayload is the exact string the device key signs:
@@ -167,11 +183,26 @@ func ensureDeviceKeyLocked(a *auth.Auth) {
 	a.DevicePrivateKey = privPEM
 }
 
+// isTokenDeviceNotMatch reports whether err is the server's device-bind
+// refusal: http 401 code 20403 "Token device not match" (2026-10-12 live
+// 实证：服务器绑定设备与 DeviceInfo 不匹配即 20403，与 client 谱系无关).
+// Msg is the body fragment doJSON embeds; the ResponseMetadata nested
+// envelope spells the uppercase "Code" shape, the flat lowercase "code"
+// shape is tolerated too.
+func isTokenDeviceNotMatch(err error) bool {
+	ue, ok := err.(*Error)
+	if !ok || ue == nil {
+		return false
+	}
+	return strings.Contains(ue.Msg, `"Code":"20403"`) || strings.Contains(ue.Msg, `"code":20403`)
+}
+
 // boundExchangeLocked renews the JWT the official-client way so it is bound
-// to the account's device. v0.12.74 magpie 对齐：单 host（boundExchangeHost）
-// × 固定身份梯子（SOLO_PC 优先），每请求 20s ctx 超时，带
-// Authorization: Cloud-IDE-JWT 头。Every failure path leaves a untouched
-// (the refreshLocked atomicity contract). Caller must hold a's write lock.
+// to the account's device. v0.12.74 magpie 对齐：单 host（boundExchangeHost）、
+// 每请求 20s ctx 超时、带 Authorization: Cloud-IDE-JWT 头；v0.12.75：身份梯子
+// 谱系感知（own-lineage rung 优先）+ 20403 短路。Every failure path leaves
+// a untouched (the refreshLocked atomicity contract). Caller must hold a's
+// write lock.
 func (c *Client) boundExchangeLocked(a *auth.Auth) error {
 	if strings.TrimSpace(a.RefreshToken) == "" {
 		return fmt.Errorf("no refreshToken")
@@ -184,7 +215,7 @@ func (c *Client) boundExchangeLocked(a *auth.Auth) error {
 	// ⚠️ 持 a 写锁期间禁止调 a.JWT()（RLock 重入死锁），直接读 a.AccessToken。
 	at := strings.TrimSpace(a.AccessToken)
 	var lastErr error
-	for _, id := range boundExchangeIdentities() {
+	for _, id := range boundExchangeIdentities(a.Variant) {
 		ts := time.Now().Unix()
 		nonce := newProofNonce()
 		proof, err := auth.SignDeviceProof(a.DevicePrivateKey, deviceProofPayload(epExchangeBound, id.ClientID, rt, ts, nonce))
@@ -219,6 +250,14 @@ func (c *Client) boundExchangeLocked(a *auth.Auth) error {
 		cancel()
 		if err != nil {
 			lastErr = err
+			// v0.12.75: 20403 短路。两个 rung 呈同一 DeviceInfo、同一密钥
+			// 签名——第一个 rung 20403 后第二个 rung 必然也败（2026-10-12
+			// live 证据：服务器绑定设备与 DeviceInfo 不匹配即 20403，与
+			// client 谱系无关），继续尝试只会多烧一次失败 proof
+			// （issue #38 服务端安全层教训）。
+			if isTokenDeviceNotMatch(err) {
+				break
+			}
 			continue
 		}
 		token, refreshToken, expiresAt, ok := parseBoundExchange(data)
