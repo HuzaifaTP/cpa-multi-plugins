@@ -31,9 +31,19 @@ import (
 // t.Setenv("QD_UMID_AUTO", "1") and stub servers only. Live runs
 // (-tags live + QD_TOKEN) skip the guard so they exercise the REAL
 // provisioning path end to end.
+//
+// v0.8.62: the daily-round clock is pinned OUTSIDE the visibility-lag margin
+// (Beijing 11:00, past the [10:00, 10:30) window of issue #27) for the same
+// hermeticity reason — without the pin, every no-target diagnosis test
+// flaked depending on the wall clock (campaignIdleDiagnosis's window branch
+// answers a different line inside the margin). Window behavior is covered
+// explicitly by checkin_window_test.go, which overrides the seam per-test.
 func TestMain(m *testing.M) {
 	if os.Getenv("QD_TOKEN") == "" {
 		os.Setenv("QD_UMID_AUTO", "0")
+		dailyWindowNow = func() time.Time {
+			return time.Date(2026, 10, 12, 11, 0, 0, 0, time.FixedZone("UTC+8", 8*3600))
+		}
 	}
 	os.Exit(m.Run())
 }

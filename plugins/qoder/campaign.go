@@ -1574,6 +1574,25 @@ func attemptViewDetailsClaims(sa *storedAuth, status *campaignStatusResponse) (m
 	return out, notes
 }
 
+// dailyWindowNow / dailyWindowMargin：每日轮次开窗判定的时间缝与边距。
+// var 供测试注入；窗口锚定北京时间 10:00（上游轮次刷新时刻，issue #27 抓包
+// 与 campaign.go roundMemoMaxAge 注释一致），与宿主本地时区无关。
+var (
+	dailyWindowNow    = time.Now
+	dailyWindowMargin = 30 * time.Minute
+)
+
+// dailyWindowJustOpened 报告此刻是否处于每日轮次开窗后的可见性滞后边距内
+// （北京时间 [10:00, 10:30)）。实弹证据（2026-10-12，u673e7fcc intl，
+// live harness）：10:01:04 裸 GET campaigns 无每日行，10:04:30 插件生产链路
+// 见 act-20261009-518 CLAIMABLE 并 claim +100 成功——行 start=10:00:00 整，
+// 可见性滞后数分钟。窗口内的「无行」不是「无投放」，是还没出现。
+func dailyWindowJustOpened(now time.Time) bool {
+	bj := now.In(time.FixedZone("UTC+8", 8*3600))
+	mins := bj.Hour()*60 + bj.Minute()
+	return mins >= 600 && mins < 600+int(dailyWindowMargin.Minutes())
+}
+
 // campaignIdleDiagnosis explains WHY no claimable row is visible, in one
 // panel-renderable line. v0.8.39: the upstream's own unavailableReason
 // taxonomy is rendered in official semantics (hub labels — 名额发完 / 成就
@@ -1598,6 +1617,11 @@ func campaignIdleDiagnosis(status *campaignStatusResponse, sa *storedAuth) strin
 	// source first; the honest audience verdict is reserved for hosts that
 	// ALREADY run the official bridge and still see no row.
 	if !status.Claimable && !hasAnyClaimBenefitRow(status) && !hasClaimableDailyRow(status) {
+		// v0.8.62：开窗滞后感知。窗口内的无行≠无投放（见 dailyWindowJustOpened
+		// 注释的实弹证据）——先说人话，别把「还没出现」渲染成「上游受众/风控」。
+		if dailyWindowJustOpened(dailyWindowNow()) {
+			return "今日无可签领权益：每日轮次 10:00（UTC+8）刚开窗，上游列表可见性有数分钟滞后——调度轮次将自动重试补领（15:00/21:00 也会兜底），无需处理；若全天官方客户端活动页同样看不到每日行，才属上游受众/风控判定" + machineIdentityHint(sa)
+		}
 		region := authRegion(sa)
 		rows := make([]string, 0, len(status.Campaigns))
 		for i := range status.Campaigns {

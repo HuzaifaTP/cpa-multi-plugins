@@ -352,6 +352,13 @@ func selfCompleteCN(lc *loginCtx, source string) {
 		loginStates.Delete(state)
 		log.Printf("trae self-complete (%s, %s) failed: %s", source, state, msg)
 	}
+	// v0.12.74：监听器路径也会 arm self-complete（issue #38 修复），而
+	// handleCallbackConn 的错误回调（error=…/isRedirect=false）只置 lc.err
+	// ——先如实回显回调错误，别落成误导性的「no authCode/refreshToken」。
+	if lc.err != nil {
+		fail(lc.err.Error())
+		return
+	}
 	if lc.authCode == "" && lc.refreshToken == "" {
 		fail("no authCode/refreshToken after restore")
 		return
@@ -496,6 +503,12 @@ func selfCompleteIntl(lc *intlloginCtx, source string) {
 		clearPendingLogin(lc.authDir)
 		intlloginStates.Delete(state)
 		log.Printf("trae-intl self-complete (%s, %s) failed: %s", source, state, msg)
+	}
+	// v0.12.74：监听器路径也会 arm self-complete（issue #38 修复，intl 同修）
+	// ——错误回调只置 lc.err，先如实回显，别落成「no authCode」。
+	if lc.err != nil {
+		fail(lc.err.Error())
+		return
 	}
 	if lc.authCode == "" {
 		fail("no authCode after restore")

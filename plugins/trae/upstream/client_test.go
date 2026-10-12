@@ -141,18 +141,37 @@ func TestRefreshTokenIfNeededRefreshesExpired(t *testing.T) {
 	}
 }
 
+// TestRefreshTokenUsesAuthAPIHost: v0.12.74 magpie 对齐改写——绑定续期
+// （第一优先）固定打 boundExchangeHost（api.trae.cn），与账号 apiHost 无关
+// （magpie site.hosts.auth 单源语义）；绑定被拒后的 legacy /cloudide 路径
+// 仍以 auth.apiHost 为第一候选（多源 fallback 行为保留）。
 func TestRefreshTokenUsesAuthAPIHost(t *testing.T) {
-	var gotHost string
+	var boundHosts, legacyHosts []string
 	c := testClient(func(r *http.Request) (*http.Response, error) {
-		gotHost = r.URL.Scheme + "://" + r.URL.Host
-		return jsonResp(200, `{"Result":{"Token":"newat"}}`), nil
+		if r.URL.Path == epExchangeBound {
+			boundHosts = append(boundHosts, r.URL.Scheme+"://"+r.URL.Host)
+			return jsonResp(400, `{"code":10101,"message":"refresh token is not matched to the client"}`), nil
+		}
+		if strings.HasSuffix(r.URL.Path, EpExchange) {
+			legacyHosts = append(legacyHosts, r.URL.Scheme+"://"+r.URL.Host)
+			return jsonResp(200, `{"Result":{"Token":"newat"}}`), nil
+		}
+		return nil, errors.New("unexpected path " + r.URL.Path)
 	})
 	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1, APIHost: "https://custom.example"}
 	if err := c.RefreshToken(a); err != nil {
 		t.Fatal(err)
 	}
-	if gotHost != "https://custom.example" {
-		t.Errorf("host=%s want auth.apiHost", gotHost)
+	if len(boundHosts) != 2 {
+		t.Fatalf("bound attempts = %v, want exactly 2 on the identity ladder", boundHosts)
+	}
+	for _, h := range boundHosts {
+		if h != boundExchangeHost {
+			t.Errorf("bound attempt host = %q, want the single magpie host %q", h, boundExchangeHost)
+		}
+	}
+	if len(legacyHosts) == 0 || legacyHosts[0] != "https://custom.example" {
+		t.Errorf("legacy hosts = %v, want auth.apiHost first", legacyHosts)
 	}
 }
 

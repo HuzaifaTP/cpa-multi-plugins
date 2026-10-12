@@ -139,7 +139,7 @@ const (
 // version is injected at build time via -ldflags "-X main.version=...".
 // Keep the default in sync with the release tag: the shipped build.sh does
 // NOT inject it (only "-s -w"), so the plugin reports this literal value.
-var version = "0.12.73"
+var version = "0.12.74"
 
 var (
 	hostAPI *C.cliproxy_host_api
@@ -1124,6 +1124,13 @@ func acceptCallback(state string) {
 			return
 		}
 		if handleCallbackConn(conn, lc) {
+			// v0.12.74：监听器路径与 resource 路由对齐——回调已解决流程
+			//（token/错误均已捕获）但宿主 poll 停止抽干时（对话框已关/
+			// 宿主 oauth 会话丢失/poll HTTP 超时），此前无人推进登录，
+			// pending+callback_received 卡满 15 分钟 TTL 且 janitor 回收
+			// 不记 outcome（issue #38 实录）。selfOnce 保证幂等，grace
+			// 语义与 resource 路由完全一致。
+			spawnSelfCompleteCN(lc)
 			closeListener(lc.listener)
 			return
 		}

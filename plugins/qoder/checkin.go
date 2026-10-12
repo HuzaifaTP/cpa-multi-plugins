@@ -117,6 +117,41 @@ func runAutoCheckin() {
 	wg.Wait()
 }
 
+// performCheckinCallFn is the test seam over performCheckinCall: the window
+// retry wrapper routes through it so tests can inject scripted verdicts
+// (NOTHING_CLAIMABLE × N → success) without a billing server.
+var performCheckinCallFn = performCheckinCall
+
+// windowRetryGap 是调度路径在开窗滞后边距内对 NOTHING_CLAIMABLE 的重试间隔。
+// var 供测试收缩。
+var windowRetryGap = 90 * time.Second
+
+// checkinWithWindowRetry 包装调度路径的签到调用：每日行在开窗后数分钟才对
+// 列表可见（2026-10-12 实弹，u673e7fcc：10:00:00 整点 tick 无行，10:04 领到
+// +100）。NOTHING_CLAIMABLE 且仍在滞后边距内时，重试至多 3 次再定案——
+// 把补领从 15:00 提前到 ~10:05。只用于调度路径；手动签到不阻塞（面板靠
+// campaignIdleDiagnosis 的窗口感知文案说明）。
+func checkinWithWindowRetry(sa *storedAuth) (map[string]any, error) {
+	res, err := performCheckinCallFn(sa)
+	for attempt := 0; attempt < 3; attempt++ {
+		if err != nil || res == nil {
+			return res, err
+		}
+		if ok, _ := res["success"].(bool); ok {
+			return res, nil
+		}
+		if r, _ := res["result"].(string); r != "NOTHING_CLAIMABLE" {
+			return res, nil
+		}
+		if !dailyWindowJustOpened(dailyWindowNow()) {
+			return res, nil
+		}
+		time.Sleep(windowRetryGap)
+		res, err = performCheckinCallFn(sa)
+	}
+	return res, err
+}
+
 // processAutoCheckinAccount handles one account's scheduled tick. Extracted so
 // runAutoCheckin can fan out per-account work without duplicating logic.
 func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
@@ -134,7 +169,7 @@ func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
 		// performCheckinCall owns the verdict now.
 		ci, err := fetchCheckinStatus(sa)
 		if err == nil && ci != nil && !ci.TodayCheckedIn {
-			if _, callErr := performCheckinCall(sa); callErr == nil {
+			if _, callErr := checkinWithWindowRetry(sa); callErr == nil {
 				// v0.8.8: 记录签到时刻（与手动签到一致），让紧随
 				// 其后的 reconcile 处于 lifecycle 宽限窗口内。
 				rememberCheckinMoment(f.ID)

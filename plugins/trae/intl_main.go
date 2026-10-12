@@ -1230,6 +1230,12 @@ func intlacceptCallback(state string) {
 			return
 		}
 		if intlHandleCallbackConn(conn, lc) {
+			// v0.12.74：监听器路径与 resource 路由对齐（intl）——回调
+			// 已解决流程但宿主 poll 停止抽干时，此前无人推进登录，
+			// pending 卡满 15 分钟 TTL 且 janitor 回收不记 outcome
+			//（issue #38 实录，cn 侧同修）。selfOnce 保证幂等，grace
+			// 语义与 resource 路由完全一致。
+			spawnSelfCompleteIntl(lc)
 			closeListener(lc.listener)
 			return
 		}
