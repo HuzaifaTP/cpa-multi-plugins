@@ -145,6 +145,7 @@ button .spin{border-color:var(--on-acc);border-top-color:transparent}
   </div>
   <div class="bar">
     <button id="refreshBtn" onclick="load(true,this)">刷新数据</button>
+    <button onclick="startOAuthLogin(this)" style="background:var(--acc);color:var(--on-acc);font-weight:600">➕ 登录新账号</button>
     <span class="toggle" id="svtime"></span>
   </div>
   <div class="summary card" id="summaryBox" style="display:none"></div>
@@ -314,6 +315,56 @@ async function api(path, opts={}){
   }catch(e){
     throw new Error(`JSON 解析失败 (${r.status}): ${text.slice(0,100)}`);
   }
+}
+async function startOAuthLogin(btn){
+  busy(btn,true);
+  try{
+    const k=getKey();
+    const r=await fetch("/v8/management/oauth/auth-url?provider="+encodeURIComponent(providerName),{
+      credentials:"omit",
+      headers:authHeaders(k)
+    });
+    if(r.status===401){showAuth();throw new Error("management key 无效或缺失");}
+    if(!r.ok){const t=await r.text();throw new Error("HTTP "+r.status+": "+t.slice(0,160));}
+    const d=await r.json();
+    if(!d.url)throw new Error("auth-url 未返回 url");
+    window.open(d.url,"_blank","noopener");
+    toast("已打开登录页","ok","授权完成后账号会自动出现；若浏览器停在无法连接的 127.0.0.1 页面，把地址栏完整链接粘贴到下方粘贴框完成登录");
+    pollOAuthState(d.state);
+  }catch(e){
+    toast("发起登录失败","err",e.message);
+  }
+  busy(btn,false);
+}
+/* v0.12.74: the plugin's own /authorize listener only CAPTURES the authCode.
+   The ExchangeToken that writes the auth file is driven by the host poll
+   (/v8/management/oauth/status?state=...). Without this loop the login sits
+   at callback_received=true forever and no credential appears. */
+let oauthPollTimer=null;
+function pollOAuthState(state){
+  if(!state) return;
+  if(oauthPollTimer) clearInterval(oauthPollTimer);
+  let ticks=0;
+  const k=getKey();
+  oauthPollTimer=setInterval(async function(){
+    ticks++;
+    if(ticks>60){clearInterval(oauthPollTimer);oauthPollTimer=null;return;}
+    try{
+      const r=await fetch("/v8/management/oauth/status?state="+encodeURIComponent(state),{
+        credentials:"omit",headers:authHeaders(k)
+      });
+      if(!r.ok) return;
+      const d=await r.json();
+      if(d.status==="ok"){
+        clearInterval(oauthPollTimer);oauthPollTimer=null;
+        toast("登录成功","ok","凭证已保存");
+        setTimeout(function(){load(true);},800);
+      }else if(d.status==="error"){
+        clearInterval(oauthPollTimer);oauthPollTimer=null;
+        toast("登录失败","err",(d.error||"unknown"));
+      }
+    }catch(e){}
+  },3000);
 }
 async function loadStatus(){
   try{

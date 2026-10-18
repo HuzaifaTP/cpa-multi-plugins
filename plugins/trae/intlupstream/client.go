@@ -365,6 +365,7 @@ func (c *Client) Execute(ctx context.Context, a *Auth, model string, messages []
 		usage       map[string]any
 		errorEvent  map[string]any
 		fullContent strings.Builder
+		finishText  string
 	)
 	renderNewText := func(data map[string]any) {
 		pid, _ := data["id"].(string)
@@ -397,6 +398,9 @@ func (c *Client) Execute(ctx context.Context, a *Auth, model string, messages []
 			usage = data
 		case "plan_item":
 			renderNewText(data)
+			if s := finishSummaryFrom(data); s != "" {
+				finishText = s
+			}
 		case "done":
 			return true
 		}
@@ -411,6 +415,10 @@ func (c *Client) Execute(ctx context.Context, a *Auth, model string, messages []
 		return nil, fmt.Errorf("trae %v: %s", code, msg)
 	}
 	id := fmt.Sprintf("chatcmpl-trae-%d", time.Now().UnixNano())
+	content := fullContent.String()
+	if tail := mergeFinishSummary(content, finishText); tail != "" {
+		content += tail
+	}
 	resp := map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
@@ -419,7 +427,7 @@ func (c *Client) Execute(ctx context.Context, a *Auth, model string, messages []
 		"choices": []any{
 			map[string]any{
 				"index":         0,
-				"message":       map[string]any{"role": "assistant", "content": fullContent.String()},
+				"message":       map[string]any{"role": "assistant", "content": content},
 				"finish_reason": "stop",
 			},
 		},
@@ -469,11 +477,13 @@ func (c *Client) ExecuteStream(ctx context.Context, a *Auth, model string, messa
 			return
 		}
 		var (
-			order      []string
-			thoughts   = map[string]string{}
-			sent       int
-			usage      map[string]any
-			errorEvent map[string]any
+			order        []string
+			thoughts     = map[string]string{}
+			sent         int
+			usage        map[string]any
+			errorEvent   map[string]any
+			finishText   string
+			contentSoFar strings.Builder
 		)
 		renderNewText := func(data map[string]any) string {
 			pid, _ := data["id"].(string)
@@ -507,8 +517,12 @@ func (c *Client) ExecuteStream(ctx context.Context, a *Auth, model string, messa
 			case "token_usage":
 				usage = data
 			case "plan_item":
+				if s := finishSummaryFrom(data); s != "" {
+					finishText = s
+				}
 				piece := renderNewText(data)
 				if piece != "" {
+					contentSoFar.WriteString(piece)
 					if err := emit(map[string]any{
 						"id":      id,
 						"object":  "chat.completion.chunk",
@@ -538,6 +552,17 @@ func (c *Client) ExecuteStream(ctx context.Context, a *Auth, model string, messa
 				"error":   map[string]any{"message": fmt.Sprintf("trae %v: %s", code, msg), "type": "api_error"},
 			})
 		} else {
+			// The `finish` tool call carries the real answer; `thought` is
+			// usually empty. Emit whatever the stream has not already sent.
+			if tail := mergeFinishSummary(contentSoFar.String(), finishText); tail != "" {
+				_ = emit(map[string]any{
+					"id":      id,
+					"object":  "chat.completion.chunk",
+					"created": created,
+					"model":   model,
+					"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"content": tail}, "finish_reason": nil}},
+				})
+			}
 			_ = emit(map[string]any{
 				"id":      id,
 				"object":  "chat.completion.chunk",
@@ -695,7 +720,26 @@ func (c *Client) GetUserInfo(a *Auth) (uid, nickname, enterpriseID string, err e
 // no diagnostic ("模型拉取失效" with nothing in the logs). Business codes
 // and empty payloads are now errors, so the caller falls back to the
 // static catalog and logs the actual reason.
-func (c *Client) FetchModels(a *Auth) ([]string, error) {
+// ModelMeta is the per-model metadata Trae publishes on /models. The
+// reverse-engineered executors only ever kept `name`, which threw away
+// everything a client needs to decide how to call the model: the pretty
+// name, whether it accepts images, and the context window. Trae ships all
+// of it — see the field notes on parseModelList.
+type ModelMeta struct {
+	Name        string
+	DisplayName string
+	Multimodal  bool
+	ContextDev  int64
+	ContextMax  int64
+	Reasoning   bool
+	Beta        bool
+	New         bool
+	Default     bool
+}
+
+// FetchModelInfos is FetchModels with metadata. Prefer this over FetchModels:
+// the names alone cannot express vision support or context limits.
+func (c *Client) FetchModelInfos(a *Auth) ([]ModelMeta, error) {
 	req, err := http.NewRequest(http.MethodGet, c.BaseURL+EpModels, nil)
 	if err != nil {
 		return nil, err
@@ -713,12 +757,20 @@ func (c *Client) FetchModels(a *Auth) ([]string, error) {
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("models upstream %d: %s", resp.StatusCode, truncate(string(body), 200))
 	}
+	// Trae returns two shapes for /models:
+	//   legacy: {"code":0,"data":[{"name":"x"}, ...]}
+	//   current: {"code":0,"data":{"list":[{"function":"solo_coder",
+	//              "models":[{"name":"gpt-5.4", "display_name":"GPT-5.4",
+	//                         "multimodal":true,
+	//                         "context_window_tokens":{"dev":272000,"max":272000},
+	//                         "features":"{\"reasoning\":{\"enable\":true}}"}]}]}}
+	// Parsing only the legacy shape made every intl account fall back to the
+	// stale static table (advertising claude-sonnet-4-5, which Trae does not
+	// offer, and hiding GPT-5.4, Gemini-3-Flash and MiniMax-M2.7).
 	var env struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-		Data    []struct {
-			Name string `json:"name"`
-		} `json:"data"`
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(body, &env); err != nil {
 		return nil, fmt.Errorf("models parse: %w", err)
@@ -726,16 +778,196 @@ func (c *Client) FetchModels(a *Auth) ([]string, error) {
 	if env.Code != 0 {
 		return nil, fmt.Errorf("models api code %d: %s", env.Code, truncate(strings.TrimSpace(env.Message), 120))
 	}
-	out := make([]string, 0, len(env.Data))
-	for _, m := range env.Data {
-		if m.Name != "" {
-			out = append(out, m.Name)
-		}
-	}
+	out := parseModelList(env.Data)
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
 	return out, nil
+}
+
+// FetchModels keeps the historical []string signature for callers that only
+// need ids (tests, catalog diffing). Metadata callers should use
+// FetchModelInfos.
+func (c *Client) FetchModels(a *Auth) ([]string, error) {
+	metas, err := c.FetchModelInfos(a)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(metas))
+	for _, m := range metas {
+		out = append(out, m.Name)
+	}
+	return out, nil
+}
+
+// traeModelWire is the /models entry as Trae sends it. `features` is a
+// JSON-encoded STRING (double-encoded object), not an object, so it needs a
+// second unmarshal.
+type traeModelWire struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	Multimodal  bool   `json:"multimodal"`
+	IsDefault   bool   `json:"is_default"`
+	IsNew       bool   `json:"is_new"`
+	IsBeta      bool   `json:"is_beta"`
+	Features    string `json:"features"`
+	Context     struct {
+		Dev int64 `json:"dev"`
+		Max int64 `json:"max"`
+	} `json:"context_window_tokens"`
+}
+
+// traeFeaturesWire is the decoded `features` payload. Only the flags we
+// surface are modelled; the object carries more (cost/access/...) that the
+// host has no field for.
+type traeFeaturesWire struct {
+	Reasoning struct {
+		Enable bool `json:"enable"`
+	} `json:"reasoning"`
+	Multimodal struct {
+		Enable bool `json:"enable"`
+	} `json:"multimodal"`
+}
+
+func decodeTraeFeatures(raw string) traeFeaturesWire {
+	var f traeFeaturesWire
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" {
+		return f
+	}
+	_ = json.Unmarshal([]byte(raw), &f)
+	return f
+}
+
+func modelMetaFromWire(m traeModelWire) ModelMeta {
+	f := decodeTraeFeatures(m.Features)
+	meta := ModelMeta{
+		Name:        m.Name,
+		DisplayName: strings.TrimSpace(m.DisplayName),
+		// `multimodal` is the authoritative top-level flag; features.multimodal
+		// mirrors it. Accept either so a shape drift on one still reports vision.
+		Multimodal: m.Multimodal || f.Multimodal.Enable,
+		ContextDev: m.Context.Dev,
+		ContextMax: m.Context.Max,
+		Reasoning:  f.Reasoning.Enable,
+		Beta:       m.IsBeta,
+		New:        m.IsNew,
+		Default:    m.IsDefault,
+	}
+	if meta.DisplayName == "" {
+		meta.DisplayName = meta.Name
+	}
+	// Older payloads only carry `dev`; the advertised ceiling is what matters.
+	if meta.ContextMax == 0 {
+		meta.ContextMax = meta.ContextDev
+	}
+	if meta.ContextDev == 0 {
+		meta.ContextDev = meta.ContextMax
+	}
+	return meta
+}
+
+// parseModelList extracts models from either /models data shape.
+func parseModelList(raw json.RawMessage) []ModelMeta {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	// Shape A (legacy): data is an array of model objects.
+	var flat []traeModelWire
+	if err := json.Unmarshal(raw, &flat); err == nil && len(flat) > 0 {
+		out := make([]ModelMeta, 0, len(flat))
+		seen := map[string]bool{}
+		for _, m := range flat {
+			if m.Name == "" || seen[m.Name] {
+				continue
+			}
+			seen[m.Name] = true
+			out = append(out, modelMetaFromWire(m))
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	// Shape B (current): data is {list:[{function, models:[...]}, ...]}.
+	var nested struct {
+		List []struct {
+			Function string          `json:"function"`
+			Models   []traeModelWire `json:"models"`
+		} `json:"list"`
+	}
+	if err := json.Unmarshal(raw, &nested); err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	out := make([]ModelMeta, 0, len(nested.List))
+	for _, grp := range nested.List {
+		for _, m := range grp.Models {
+			if m.Name == "" || seen[m.Name] {
+				continue
+			}
+			seen[m.Name] = true
+			out = append(out, modelMetaFromWire(m))
+		}
+	}
+	return out
+}
+
+// modelNamesFromData is the legacy name-only view, kept for tests that lock
+// the flattening contract.
+func modelNamesFromData(raw json.RawMessage) []string {
+	metas := parseModelList(raw)
+	out := make([]string, 0, len(metas))
+	for _, m := range metas {
+		out = append(out, m.Name)
+	}
+	return out
+}
+
+// finishSummaryFrom extracts the assistant's actual reply from a `finish`
+// tool call. Trae's intl SOLO protocol delivers the final answer as
+// tool_call_info{name:"finish", params:{summary:"..."}}; the plan_item
+// `thought` field is normally EMPTY, so reading only `thought` returned an
+// empty message for most prompts while still billing the completion tokens.
+func finishSummaryFrom(data map[string]any) string {
+	tc, ok := data["tool_call_info"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	if name, _ := tc["name"].(string); name != "finish" {
+		return ""
+	}
+	params, ok := tc["params"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	s, _ := params["summary"].(string)
+	return strings.TrimSpace(s)
+}
+
+// mergeFinishSummary folds the finish summary into already-accumulated content
+// and returns only the text still to be emitted. Three cases observed live:
+//
+//	accumulated empty            -> send the whole summary
+//	accumulated is a prefix      -> send the remainder ("Binary" -> full answer)
+//	accumulated already has it   -> send nothing (no duplication)
+//	otherwise                    -> append after a blank line
+func mergeFinishSummary(accumulated, summary string) string {
+	s := strings.TrimSpace(summary)
+	if s == "" {
+		return ""
+	}
+	acc := strings.TrimSpace(accumulated)
+	if acc == "" {
+		return summary
+	}
+	if strings.HasPrefix(s, acc) {
+		return s[len(acc):]
+	}
+	if strings.Contains(acc, s) {
+		return ""
+	}
+	return "\n\n" + s
 }
 
 // Helpers

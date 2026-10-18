@@ -272,7 +272,7 @@ func intlmodelCatalogForAuth(storageJSON []byte, authID string, a *upstream.Auth
 	} else if refreshed {
 		intlpersistRefreshedAuthTo(authID, a)
 	}
-	dynamic, err := intlupstreamClient.FetchModels(a)
+	dynamic, err := intlupstreamClient.FetchModelInfos(a)
 	if err != nil {
 		log.Printf("model.for_auth %s: %v — persisted snapshot / static fallback", a.UID, err)
 		if snap, ok := persistedSnapshotForStorage(storageJSON, variantIntl); ok {
@@ -284,22 +284,29 @@ func intlmodelCatalogForAuth(storageJSON []byte, authID string, a *upstream.Auth
 	// the virtual models below are not duplicated.
 	out := make([]pluginapi.ModelInfo, 0, len(dynamic)+2)
 	seen := map[string]bool{"auto": true, "work": true}
-	for _, id := range dynamic {
-		if id == "" || id == "auto" || id == "work" {
+	for _, m := range dynamic {
+		if m.Name == "" || m.Name == "auto" || m.Name == "work" {
 			continue
 		}
-		nid := id + "-intl"
+		nid := m.Name + "-intl"
 		if seen[nid] {
 			continue
 		}
 		seen[nid] = true
-		out = append(out, pluginapi.ModelInfo{ID: nid, Name: nid, OwnedBy: intlproviderName})
+		out = append(out, intlModelInfo(nid, m))
 	}
 	// Always include "auto" and "work" as virtual models.
 	out = append(out,
 		pluginapi.ModelInfo{ID: "auto", Name: "auto (server pick)"},
 		pluginapi.ModelInfo{ID: "work", Name: "work (fast mode)"},
 	)
+	// Union with the extended catalog: Trae's /models only advertises the
+	// solo_coder picker list, but chat_sessions ACCEPTS any model_name from
+	// the full Trae catalog (verified 2026-10-18: claude-sonnet-4-5, gpt-6-sol,
+	// glm-5.3, kimi-k3, minimax-m3, DeepSeek-V4-*, Doubao-Seed-* all create
+	// sessions with code 0). The official desktop IDE shows these models —
+	// the plugin should too, so clients can route to them.
+	out = intlMergeExtendedCatalog(out, seen)
 	// v0.12.63: stamp the last-known-good catalog into the credential file
 	// (advertised ids, pre exclusion — exclusion re-applies on every serve
 	// branch). Change-guarded inside; best-effort.
@@ -307,15 +314,106 @@ func intlmodelCatalogForAuth(storageJSON []byte, authID string, a *upstream.Auth
 	return out
 }
 
+// intlExtendedCatalog lists additional Trae models that the /models endpoint
+// does not advertise for the solo_coder function but that chat_sessions
+// accepts and serves. Verified live 2026-10-18 against an Intl credential:
+// kimi-k3 and minimax-m3 both return a model_config event naming themselves
+// and produce completion tokens, yet /models omits them from the picker list.
+// The official Trae desktop IDE exposes them, so the plugin should too.
+// Suffix with -intl like the dynamic entries.
+//
+// Every other candidate was tested and deliberately NOT listed:
+//   claude-*, gpt-5.6-sol, gpt-6-astra, gemini-4-argon, glm-*, kimi-k2.*,
+//   qwen*, DeepSeek-V4-*, Doubao-Seed-*  → not served on the Intl endpoint
+//   (silently downgraded to a default model).
+//   gpt-6-sol / gpt-6-luna / gpt-6.1-sol → recognised but produce zero
+//   completion tokens (Pro-gated); listing them would advertise a dead model.
+func intlExtendedCatalog() []upstream.ModelMeta {
+	return []upstream.ModelMeta{
+		{Name: "kimi-k3", DisplayName: "Kimi-K3"},
+		{Name: "minimax-m3", DisplayName: "MiniMax-M3"},
+	}
+}
+
+// intlMergeExtendedCatalog appends any extended-catalog model not already
+// present (by suffixed ID) in out. Mutates and returns out.
+func intlMergeExtendedCatalog(out []pluginapi.ModelInfo, seen map[string]bool) []pluginapi.ModelInfo {
+	for _, m := range intlExtendedCatalog() {
+		nid := m.Name + "-intl"
+		if seen[nid] {
+			continue
+		}
+		seen[nid] = true
+		out = append(out, intlModelInfo(nid, m))
+	}
+	return out
+}
+
+// intlModelInfo maps Trae's published metadata onto the host's ModelInfo.
+// Without this the catalog carried ids only: every DisplayName was empty,
+// ContextLength 0 and SupportedInputModalities nil, so nothing downstream
+// could tell that gpt-5.4 / gemini-3.1-pro accept images or how much context
+// they take — even though Trae reports both on /models.
+func intlModelInfo(id string, m upstream.ModelMeta) pluginapi.ModelInfo {
+	info := pluginapi.ModelInfo{
+		ID:          id,
+		Name:        id,
+		DisplayName: m.DisplayName,
+		OwnedBy:     intlproviderName,
+	}
+	if info.DisplayName == "" {
+		info.DisplayName = m.Name
+	}
+	if m.ContextMax > 0 {
+		info.ContextLength = m.ContextMax
+		info.InputTokenLimit = m.ContextMax
+	}
+	if m.ContextDev > 0 && m.ContextDev != m.ContextMax {
+		// The dev tier is the default; record it as the completion budget so
+		// callers that clamp output against ContextLength stay inside it.
+		info.MaxCompletionTokens = m.ContextDev
+	}
+	// Trae publishes `multimodal: true` for the vision-capable models.
+	info.SupportedInputModalities = []string{"text"}
+	if m.Multimodal {
+		info.SupportedInputModalities = []string{"text", "image"}
+	}
+	info.SupportedOutputModalities = []string{"text"}
+	if m.Reasoning {
+		// Trae exposes reasoning as an on/off switch, not a token budget.
+		info.Thinking = &pluginapi.ThinkingSupport{ZeroAllowed: true, DynamicAllowed: true}
+	}
+	if m.Beta {
+		info.Description = "beta"
+	}
+	return info
+}
+
+// intlstaticModels is the offline fallback, used only when both the live
+// fetch and the persisted snapshot are unavailable. The roster mirrors what
+// /models currently returns (solo_coder) so the fallback never advertises a
+// model Trae does not serve — the previous table listed claude-sonnet-4-5,
+// which is not in the Intl catalog at all.
 func intlstaticModels() []pluginapi.ModelInfo {
 	// "-intl" suffix namespaces Intl models so host routing can never send
 	// a CN/SOLO-model request to an Intl credential (or vice versa).
 	// "auto"/"work" are Intl-exclusive virtual names and stay unsuffixed.
-	known := []string{"auto", "work", "gpt-5.2-intl", "gemini-3.1-pro-intl", "kimi-k2.5-intl", "claude-sonnet-4-5-intl"}
-	out := make([]pluginapi.ModelInfo, 0, len(known))
-	for _, id := range known {
-		out = append(out, pluginapi.ModelInfo{ID: id, Name: id, OwnedBy: intlproviderName})
+	static := []upstream.ModelMeta{
+		{Name: "gpt-5.4", DisplayName: "GPT-5.4", Multimodal: true, ContextDev: 272000, ContextMax: 272000, Reasoning: true, Beta: true},
+		{Name: "gpt-5.2", DisplayName: "GPT-5.2", Multimodal: true, ContextDev: 272000, ContextMax: 272000, Reasoning: true},
+		{Name: "minimax-m2.7", DisplayName: "MiniMax-M2.7", ContextDev: 200000, ContextMax: 200000, Reasoning: true},
+		{Name: "kimi-k2.5", DisplayName: "Kimi-K2.5", ContextDev: 200000, ContextMax: 200000, Reasoning: true},
+		{Name: "gemini-3.1-pro", DisplayName: "Gemini-3.1-Pro-Preview", Multimodal: true, ContextDev: 200000, ContextMax: 1000000, Reasoning: true},
+		{Name: "gemini-3-flash-solo", DisplayName: "Gemini-3-Flash-Preview", Multimodal: true, ContextDev: 200000, ContextMax: 1000000, Reasoning: true},
 	}
+	out := make([]pluginapi.ModelInfo, 0, len(static)+2)
+	for _, m := range static {
+		out = append(out, intlModelInfo(m.Name+"-intl", m))
+	}
+	out = append(out,
+		pluginapi.ModelInfo{ID: "auto", Name: "auto (server pick)"},
+		pluginapi.ModelInfo{ID: "work", Name: "work (fast mode)"},
+	)
 	return out
 }
 
