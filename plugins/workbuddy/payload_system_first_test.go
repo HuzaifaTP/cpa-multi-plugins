@@ -109,10 +109,14 @@ func TestEnsureSystemFirstIntlRealmInjects(t *testing.T) {
 	if !ensureSystemMessageInPlace(obj, sa) {
 		t.Fatal("Intl realm user-first payload must be injected with a system message")
 	}
-	if role, _ := obj["messages"][0].(map[string]any)["role"].(string); role != "system" {
+	msgs, _ := obj["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("messages len = %d, want 2 (system + user)", len(msgs))
+	}
+	if role, _ := msgs[0].(map[string]any)["role"].(string); role != "system" {
 		t.Fatalf("first message role = %q, want system", role)
 	}
-	if got, _ := obj["messages"][1].(map[string]any)["content"].(string); got != "hi" {
+	if got, _ := msgs[1].(map[string]any)["content"].(string); got != "hi" {
 		t.Fatalf("original user message displaced: %q", got)
 	}
 }

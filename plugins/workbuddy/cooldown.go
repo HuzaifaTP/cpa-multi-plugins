@@ -318,9 +318,14 @@ func recordUpstreamFailure(authID string, sa *storedAuth, model string, status i
 	}
 	// Daily-allowance wording (issue #35 supplementary tier, v0.9.58): the
 	// natural reset is the next UTC+8 midnight. A declared reset instant in
-	// the payload ("将在 … 重置") wins when parsable.
+	// the payload ("将在 … 重置") wins when parsable. v0.9.59: the parse is
+	// anchored to the table clock (cooldownNowFn), the SAME clock the
+	// midnight fallback below uses — the real-clock entry point
+	// parseRateLimitResetAt made the branch internally inconsistent under
+	// a frozen table and the v0.9.58 test suite time-brittle (the frozen
+	// dates passed their own horizon on 2026-10-13 and every day after).
 	if isDailyQuotaFrame(body) {
-		until, ok := parseRateLimitResetAt(body)
+		until, ok := parseRateLimitResetAtFrom(body, cooldownNowFn())
 		if !ok {
 			until = nextDailyResetUTC8(cooldownNowFn())
 		}

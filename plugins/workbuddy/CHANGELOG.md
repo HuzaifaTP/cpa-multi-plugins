@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.9.59
+
+### INTL realm joins the system-first ensure gates (issue #40, PR #42)
+
+Field evidence: the INTL upstream (www.codebuddy.ai) enforces the same
+`messages[0].role == "system"` position check as Global — a user-first
+request fails deterministically with `11128` (issue #40's raw body:
+`"request illegal"`; the contributor's fresh-credential probe:
+`"first message is not system prompt"`, 426 ms fast-reject). The
+`ensureSystemMessageInPlace` / `ensureSystemMessage` gates predate the
+INTL merge and only covered Global credentials, so OpenAI-style clients
+whose first message is `user` reached the INTL gateway raw and got the
+11128 500. Both gates now widen to `isGlobalDomain || isIntlDomain`;
+CN stays excluded (author-verified: CN neither requires nor is harmed by
+the absence of the injection — CN traffic remains byte-identical).
+Live-verified by the contributor on a fresh INTL credential:
+user-first `11128` before the patch, `200 finish_reason=stop` after.
+
+### Cooldown daily-tier clock consistency (v0.9.58 follow-up)
+
+The daily-allowance branch of `recordUpstreamFailure` parsed a declared
+reset instant ("将在 … 重置") with the REAL clock while its midnight
+fallback used the freezable table clock — internally inconsistent, and
+it made `TestDailyQuotaDeclaredResetWins` time-brittle (the frozen
+2026-10-12 dates crossed their own horizon on 2026-10-13 and every day
+after, turning `go test ./...` red on main). The parse now anchors to
+`cooldownNowFn()` — identical behavior in production (both clocks are
+`time.Now` there), deterministic under the frozen table. Also repairs
+the PR #42 test's map-index compile error (fork PRs run no CI; the
+`obj["messages"][0]` index on `any` never compiled).
+
 ## 0.9.58
 
 ### Daily-quota tier for the cooldown table + login platform lineage (issues #35/#36 follow-up)
