@@ -335,8 +335,10 @@ function loadCapSdk(){
   capSdkPromise=new Promise(function(res,rej){
     const s=document.createElement('script');
     s.src=CAP_SDK_URL;
-    s.onload=function(){res()};
-    s.onerror=function(){capSdkPromise=null; rej(new Error('验证码组件加载失败（浏览器需能访问 alicdn.com）'))};
+    let done=false;
+    const timer=setTimeout(function(){ if(!done){ done=true; capSdkPromise=null; rej(new Error('验证码组件加载超时（浏览器需能访问 alicdn.com，请检查加速器/代理）')); } },12000);
+    s.onload=function(){ if(!done){ done=true; clearTimeout(timer); res(); } };
+    s.onerror=function(){ if(!done){ done=true; clearTimeout(timer); capSdkPromise=null; rej(new Error('验证码组件加载失败（浏览器需能访问 alicdn.com）')); } };
     document.head.appendChild(s);
   });
   return capSdkPromise;
@@ -380,7 +382,13 @@ async function claimPlan(btn){
       element:'#'+boxId, button:'#'+btnId, captchaLogoImg:'', showErrorTip:false,
       getInstance:function(inst){
         instRef=inst;
-        try{ (inst.startTracelessVerification||inst.show).call(inst); }
+        try{
+          const bb=document.getElementById(btnId);
+          if(bb){ bb.click(); return; } // popup 模式官方触发：程序化点 SDK 绑定的隐藏按钮（实测最可靠）
+          if(inst&&typeof inst.show==='function'){ inst.show(); return; }
+          if(inst&&typeof inst.startTracelessVerification==='function'){ inst.startTracelessVerification(); return; }
+          toast('验证码实例缺少触发方法：'+(inst?Object.getOwnPropertyNames(Object.getPrototypeOf(inst)||inst).join(','):'实例为空')+'，请反馈'); finish();
+        }
         catch(e){ toast('验证码启动失败：'+e.message); finish(); }
       },
       success:async function(result){
@@ -438,7 +446,13 @@ async function mintPoolTokens(btn){
         element:'#'+boxId, button:'#'+btnId, captchaLogoImg:'', showErrorTip:false,
         getInstance:function(inst){
           instRef=inst;
-          try{ (inst.startTracelessVerification||inst.show).call(inst); }
+          try{
+            const bb=document.getElementById(btnId);
+            if(bb){ bb.click(); return; } // popup 模式官方触发：程序化点 SDK 绑定的隐藏按钮（实测最可靠）
+            if(inst&&typeof inst.show==='function'){ inst.show(); return; }
+            if(inst&&typeof inst.startTracelessVerification==='function'){ inst.startTracelessVerification(); return; }
+            clearTimeout(watchdog); res(false);
+          }
           catch(e){ clearTimeout(watchdog); res(false); }
         },
         success:function(result){
