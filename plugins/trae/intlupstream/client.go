@@ -24,6 +24,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -269,7 +270,16 @@ func flattenQuery(messages []map[string]any) string {
 // dropped immediately; the TTL is only a backstop so a stale fingerprint
 // cannot capture an unrelated conversation that opens with the same words.
 const (
-	intlSessionTTL = 24 * time.Hour
+	// intlSessionTTL = 0 disables expiry. A conversation's Trae chat is kept
+	// for as long as the plugin runs: re-sending a long history after an idle
+	// gap is far more expensive than holding the chat open, and reuse is
+	// already guarded — a chat is dropped the moment a turn fails, and reuse
+	// only fires when the incoming conversation is LONGER than what has been
+	// delivered, so a fresh conversation can never inherit an old one.
+	intlSessionTTL = 0
+	// intlSessMax caps the map so a long-running plugin cannot grow without
+	// bound. Least-recently-used entries are evicted first.
+	intlSessMax = 512
 	intlKeyMsgs    = 2
 )
 
@@ -334,7 +344,7 @@ func intlSessGet(key string) *intlSessEntry {
 	if e == nil {
 		return nil
 	}
-	if time.Since(e.seen) > intlSessionTTL {
+	if intlSessionTTL > 0 && time.Since(e.seen) > intlSessionTTL {
 		delete(intlSessCache, key)
 		return nil
 	}
@@ -345,11 +355,21 @@ func intlSessPut(key, id string, turns int) {
 	intlSessMu.Lock()
 	defer intlSessMu.Unlock()
 	intlSessCache[key] = &intlSessEntry{id: id, turns: turns, seen: time.Now()}
-	// opportunistic sweep
+	if len(intlSessCache) <= intlSessMax {
+		return
+	}
+	// Evict the least-recently-used entries down to the cap.
+	type kv struct {
+		k string
+		t time.Time
+	}
+	all := make([]kv, 0, len(intlSessCache))
 	for k, v := range intlSessCache {
-		if time.Since(v.seen) > intlSessionTTL {
-			delete(intlSessCache, k)
-		}
+		all = append(all, kv{k, v.seen})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].t.Before(all[j].t) })
+	for i := 0; i < len(all)-intlSessMax; i++ {
+		delete(intlSessCache, all[i].k)
 	}
 }
 
