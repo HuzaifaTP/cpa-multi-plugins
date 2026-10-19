@@ -4,13 +4,24 @@ Provider plugins for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
 
 | Plugin | Version |
 | --- | --- |
-| workbuddy | 0.9.58 |
-| trae | 0.12.75 |
+| workbuddy | 0.9.59 |
+| trae | 0.12.77 |
 | qoder | 0.8.63 |
-| zcode | 0.2.0 |
+| zcode | 0.2.1 |
 | mimo | 0.2.17 |
 
 Tagged commits are built by CI; per-platform artifacts are attached to each [release](../../releases). Release notices are also posted to the [Telegram channel](https://t.me/+hI7SCfhLF-YwMDUx).
+
+## Plugin stores / update feeds (issue #39)
+
+[`registry.json`](registry.json) is the machine-readable feed for stores and updaters — fetch the raw file at
+`https://raw.githubusercontent.com/mmqz/cpa-multi-plugins/main/registry.json` (schema v2):
+
+- per-plugin `version` (kept in lockstep with each `plugins/<id>/VERSION` by CI guards), `changelog` one-liner for the update prompt, `platforms`, and `split_channels` for the legacy per-variant ids;
+- top-level `downloads.unified` / `downloads.split` with stable `releases/latest/download/<asset>.zip` URLs for all five platforms — every zip bundles all five plugins;
+- `homepage` / `repository` / `license` / `tags` for store listing metadata.
+
+Version bumps are one command — `cd tools/registry && go run . sync` rewrites the registry versions and this README's table from `plugins/*/VERSION`; the lockstep guards (`go test ./...` in the same directory, wired into the CI `test` job) keep a half-synced registry out of main.
 
 ## Protocol Sources
 

@@ -253,9 +253,49 @@ jobs:
             cpa-multi-plugins-split-${{ matrix.os }}-${{ matrix.arch }}.zip
           retention-days: 30
 
+  # Issue #39: the registry lockstep guards and the plugin unit-test suites
+  # only ever ran on contributor machines before — a drifted registry.json or
+  # a red test suite could ride a green build straight into a release. This
+  # job runs both on every main push (badge) and every tag (release gate).
+  test:
+    name: Unit tests + registry guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Deterministic horizon for the cooldown / queue time tests; the suites
+      # are clock-anchored by design (see workbuddy 0.9.59 fix) and UTC makes
+      # the runners match the reference environment.
+      TZ: UTC
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: false
+
+      - name: Registry lockstep guards (tools/registry)
+        run: |
+          cd tools/registry
+          go test -count=1 ./...
+
+      - name: Plugin unit tests
+        run: |
+          PLUGINS="workbuddy qoder trae zcode mimo"
+          for plugin in $PLUGINS; do
+            echo "=== go test $plugin ==="
+            cd plugins/$plugin
+            go mod download
+            go test -count=1 ./...
+            cd ../..
+          done
+        shell: bash
+
   release:
     name: Create Release
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-latest
     # Deep-audit hardening: publish only when the build job itself succeeded.
     # The optional darwin-amd64 cross leg keeps reporting success via
@@ -264,7 +304,9 @@ jobs:
     # silently shipping an incomplete asset set.
     # v0.12.76: tag-gated as well — main-branch CI runs (badge refresh) must
     # build but NEVER publish. workflow_dispatch keeps its version input path.
-    if: always() && !cancelled() && needs.build.result == 'success' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
+    # v0.8.72 (issue #39): tests gate the release too — a red suite or a
+    # drifted registry.json must never ship as a tagged build.
+    if: always() && !cancelled() && needs.build.result == 'success' && needs.test.result == 'success' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
     steps:
       - name: Checkout
         uses: actions/checkout@v4
