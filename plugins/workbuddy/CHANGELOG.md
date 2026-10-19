@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.9.60
+
+### Hermetic Intl billing test (issue #39 CI follow-up)
+
+The new CI `test` job (registry lockstep guards + all five plugin suites,
+added for issue #39) immediately caught a latent network dependency:
+`TestBillingHeaders_IntlRealm` created a local `httptest` server but never
+wired it in — `billingCallOnce` dialed the real `www.codebuddy.ai`, so the
+handler's header assertions (X-IDE-Type / X-Requested-With / Bearer) never
+executed and the suite only passed on machines where the domain resolved.
+GitHub runners map it to `0.0.0.1`, producing a 4.5s dial timeout and a
+red release gate. Fix: `setBillingBaseIntl` (the CN and Global bases always
+had test setters; Intl was the odd one out) pins the base at the local
+server — the test now runs hermetic, fast, and its assertions actually
+fire for the first time. Also swept all five plugin suites under a dead
+proxy (loopback exempt) to confirm no other plain test touches the real
+network, and `TestBillingProxyFunc_ConfigWinsOverEnv` is now
+snapshot-aware: `http.ProxyFromEnvironment` freezes the process
+environment on its first call anywhere in the process (earlier billing
+tests have already taken that snapshot), so `t.Setenv` could never
+influence it — the test asserts against the launch environment instead
+and no longer goes red on proxied developer shells.
+
 ## 0.9.59
 
 ### INTL realm joins the system-first ensure gates (issue #40, PR #42)

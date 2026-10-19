@@ -57,6 +57,12 @@ func TestBillingHeaders_IntlRealm(t *testing.T) {
 	sa := &storedAuth{}
 	sa.Auth.Domain = "codebuddy.ai"
 	sa.Auth.AccessToken = "intl-test-token"
+	// v0.9.60: pin the Intl billing base at the local httptest server.
+	// Before this the request went to the real www.codebuddy.ai — the
+	// handler assertions below never ran, and the suite timed out on CI
+	// runners whose DNS maps the domain to 0.0.0.1 (issue #39 follow-up).
+	restore := setBillingBaseIntl(srv.URL)
+	defer restore()
 	if _, err := billingCallOnce(sa, "/probe", nil, 0); err != nil {
 		t.Fatalf("billingCallOnce: %v", err)
 	}

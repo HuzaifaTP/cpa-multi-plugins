@@ -124,6 +124,17 @@ func setBillingBaseGlobal(s string) func() {
 	return func() { billingBaseGlobal = old }
 }
 
+// setBillingBaseIntl temporarily overrides billingBaseIntl for tests.
+// v0.9.60 (issue #39 CI follow-up): TestBillingHeaders_IntlRealm used to
+// dial the real www.codebuddy.ai because only the CN/Global bases had test
+// setters — the suite passed wherever the domain resolved (developer
+// machines) and timed out on GitHub runners, whose DNS maps it to 0.0.0.1.
+func setBillingBaseIntl(s string) func() {
+	old := billingBaseIntl
+	billingBaseIntl = s
+	return func() { billingBaseIntl = old }
+}
+
 // billingBaseFor returns the billing API base URL for the given auth's domain.
 // CN accounts → https://www.codebuddy.cn; Global → https://www.workbuddy.ai.
 // Falls back to the test-overridable billingBase for CN/nil.

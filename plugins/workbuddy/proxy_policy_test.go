@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -50,42 +51,58 @@ func TestRememberHostProxy(t *testing.T) {
 // host-configured proxy (config.yaml proxy-url delivered via
 // HostConfigSummary) takes precedence over environment variables; with neither
 // present the result is nil (plain direct — historical default).
+//
+// v0.9.60: http.ProxyFromEnvironment snapshots the process environment on
+// its FIRST call anywhere in the process (net/http envProxyOnce) — the
+// billing_* tests that run earlier have already taken that snapshot, so
+// t.Setenv inside this test cannot influence what billingProxyFunc sees.
+// On a proxied developer shell that snapshot is non-empty and the old
+// "neither configured → nil" assertion went red for the wrong reason.
+// The test now asserts against the LAUNCH environment instead: on a clean
+// runner the snapshot is empty and the full ladder holds; on a proxied
+// shell the config-wins leg is still genuinely exercised against the live
+// launch-time proxy — which is the production guarantee being pinned.
 func TestBillingProxyFunc_ConfigWinsOverEnv(t *testing.T) {
 	orig := currentHostProxyURL()
 	defer restoreHostProxy(orig)
 	hostProxyMu.Lock()
 	hostProxyURL = ""
 	hostProxyMu.Unlock()
-	t.Setenv("HTTP_PROXY", "")
-	t.Setenv("HTTPS_PROXY", "")
 
 	req, _ := http.NewRequest(http.MethodPost, "https://www.codebuddy.ai/v2/billing/meter/get-user-resource", nil)
 
-	// Neither configured → nil (direct).
-	got, err := billingProxyFunc(req)
-	if err != nil || got != nil {
-		t.Fatalf("no proxy configured: got %q err %v, want nil/nil", got, err)
+	// Neither configured → nil (direct) — only assertable on a clean
+	// launch environment (a proxied shell's snapshot is immutable here).
+	if envProxyAtLaunch() == "" {
+		got, err := billingProxyFunc(req)
+		if err != nil || got != nil {
+			t.Fatalf("no proxy configured: got %q err %v, want nil/nil", got, err)
+		}
 	}
 
-	// Config proxy set → wins.
+	// Config proxy set → wins — over an empty snapshot on CI and over the
+	// live launch-time proxy on a proxied developer shell alike.
 	rememberHostProxy("http://10.0.0.1:7890")
-	got, err = billingProxyFunc(req)
+	got, err := billingProxyFunc(req)
 	if err != nil {
 		t.Fatalf("config proxy parse: %v", err)
 	}
 	if got == nil || got.Host != "10.0.0.1:7890" {
 		t.Fatalf("config proxy not honored: %v", got)
 	}
+}
 
-	// Env proxy set too → config still wins.
-	t.Setenv("HTTPS_PROXY", "http://10.9.9.9:3128")
-	got, err = billingProxyFunc(req)
-	if err != nil {
-		t.Fatalf("config-vs-env: %v", err)
+// envProxyAtLaunch reports any proxy environment variable visible to the
+// test process — a faithful-enough proxy for net/http's frozen
+// ProxyFromEnvironment snapshot (earlier tests' t.Setenv calls are restored
+// by the time we read this).
+func envProxyAtLaunch() string {
+	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
 	}
-	if got == nil || got.Host != "10.0.0.1:7890" {
-		t.Fatalf("env proxy must not override config proxy: %v", got)
-	}
+	return ""
 }
 
 // TestHostHTTPDo_BridgeMarkerOverridesDomainBypass pins the v0.9.52 fallback

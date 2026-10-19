@@ -283,14 +283,20 @@ jobs:
 
       - name: Plugin unit tests
         run: |
+          # Aggregate failures across plugins: one red suite must not hide
+          # the next plugin's results (bash -e would abort at the first).
           PLUGINS="workbuddy qoder trae zcode mimo"
+          FAILED=""
           for plugin in $PLUGINS; do
             echo "=== go test $plugin ==="
-            cd plugins/$plugin
-            go mod download
-            go test -count=1 ./...
-            cd ../..
+            if ! (cd plugins/$plugin && go mod download && go test -count=1 ./...); then
+              FAILED="$FAILED $plugin"
+            fi
           done
+          if [ -n "$FAILED" ]; then
+            echo "::error::test suites failed for:$FAILED"
+            exit 1
+          fi
         shell: bash
 
   release:
