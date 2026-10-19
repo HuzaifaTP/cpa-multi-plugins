@@ -15,13 +15,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -41,6 +45,9 @@ const (
 
 	// Models list (GET, returns available models for selection)
 	EpModels = "/models"
+
+	// EpChatSessionMessages appends a further user turn to an existing session.
+	EpChatSessionMessages = "/chat_sessions/%s/messages"
 
 	// Stream timeout (5 minutes for long reasoning).
 	StreamTimeout = 5 * time.Minute
@@ -250,18 +257,390 @@ func flattenQuery(messages []map[string]any) string {
 	return string(raw)
 }
 
+// PATCH(local): conversation memory.
+//
+// Every request used to open a brand-new chat_session, so the model started
+// from zero each turn — a follow-up question could not see anything said
+// before it. Trae keeps a session's turns in context, so we reuse one session
+// per conversation and only send the NEW messages each time.
+//
+// The conversation is identified by its system prompt + first user message,
+// which stay stable while the client appends turns. A session that fails is
+// dropped immediately; the TTL is only a backstop so a stale fingerprint
+// cannot capture an unrelated conversation that opens with the same words.
+const (
+	intlSessionTTL = 24 * time.Hour
+	intlKeyMsgs    = 2
+)
+
+type intlSessEntry struct {
+	id    string
+	turns int // number of source messages already delivered to the session
+	seen  time.Time
+}
+
+var (
+	intlSessMu    sync.Mutex
+	intlSessCache = map[string]*intlSessEntry{}
+)
+
+// conversationKey identifies a conversation by what never changes inside it:
+// the system prompt (if any) plus the FIRST user message. Keying on "the first
+// N messages" is wrong — the assistant's reply joins the array on the next
+// turn, so the key would shift and every conversation would open a new session
+// on turn 2.
+func conversationKey(messages []map[string]any) string {
+	h := sha256.New()
+	firstUser := -1
+	for i, m := range messages {
+		role, _ := m["role"].(string)
+		if role == "system" {
+			var body string
+			switch c := m["content"].(type) {
+			case string:
+				body = c
+			default:
+				raw, _ := json.Marshal(c)
+				body = string(raw)
+			}
+			h.Write([]byte("system"))
+			h.Write([]byte{0})
+			h.Write([]byte(body))
+			h.Write([]byte{0})
+		} else if role == "user" && firstUser < 0 {
+			firstUser = i
+			var body string
+			switch c := m["content"].(type) {
+			case string:
+				body = c
+			default:
+				raw, _ := json.Marshal(c)
+				body = string(raw)
+			}
+			h.Write([]byte("user"))
+			h.Write([]byte{0})
+			h.Write([]byte(body))
+			h.Write([]byte{0})
+		}
+	}
+	_ = firstUser
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func intlSessGet(key string) *intlSessEntry {
+	intlSessMu.Lock()
+	defer intlSessMu.Unlock()
+	e := intlSessCache[key]
+	if e == nil {
+		return nil
+	}
+	if time.Since(e.seen) > intlSessionTTL {
+		delete(intlSessCache, key)
+		return nil
+	}
+	return e
+}
+
+func intlSessPut(key, id string, turns int) {
+	intlSessMu.Lock()
+	defer intlSessMu.Unlock()
+	intlSessCache[key] = &intlSessEntry{id: id, turns: turns, seen: time.Now()}
+	// opportunistic sweep
+	for k, v := range intlSessCache {
+		if time.Since(v.seen) > intlSessionTTL {
+			delete(intlSessCache, k)
+		}
+	}
+}
+
+func intlSessDrop(key string) {
+	intlSessMu.Lock()
+	defer intlSessMu.Unlock()
+	delete(intlSessCache, key)
+}
+
+// trailingUserText returns the user messages that come AFTER the last
+// assistant/system message — i.e. what is genuinely new in this request.
+//
+// Trae's chat already contains every earlier user turn AND every assistant
+// reply, so re-sending the slice messages[e.turns:] is wrong: it repeats the
+// previous answer inside the next prompt ("[Assistant] ok... What number?"),
+// which both wastes tokens and confuses the model into replying with nothing.
+func trailingUserText(messages []map[string]any) string {
+	start := 0
+	for i, m := range messages {
+		role, _ := m["role"].(string)
+		if role != "user" {
+			start = i + 1
+		}
+	}
+	if start >= len(messages) {
+		return ""
+	}
+	return flattenQuery(messages[start:])
+}
+
+// PATCH(local): large-context support via multi-message sessions.
+//
+// Trae stores every message in the user_history service, which enforces a
+// per-message value-size cap. Exceeding it fails with:
+//
+//   failed to add user message to history: ... ERR value size over limit
+//
+// Measured on an Intl credential (2026-10-19):
+//   ~45k tokens  (~180k chars)  -> accepted
+//   ~122k tokens (~490k chars)  -> rejected (value size over limit)
+//
+// A session itself is NOT capped: POST /chat_sessions/{id}/messages appends
+// further turns and the model keeps them in context (verified: a codeword
+// placed in turn 1 was recalled in turn 4 of a ~248k-token session, with
+// prompt_tokens reaching ~81k). So an oversized conversation is split across
+// several messages, which lets callers use the model's full context window
+// instead of dying at the single-message cap.
+const (
+	// intlMaxChunkChars keeps each message well inside the observed safe
+	// zone. ~150k chars ≈ 37k tokens for English prose.
+	intlMaxChunkChars = 150_000
+	// intlMaxChunks bounds the work: 6 × 150k chars ≈ 225k tokens, enough to
+	// fill a 272k-context model without unbounded fan-out.
+	intlMaxChunks = 6
+)
+
+// splitQueryChunks cuts a flattened query string into at most intlMaxChunks
+// pieces of roughly intlMaxChunkChars, breaking on whitespace so a word is
+// never torn in half. Returns a single-element slice when no split is needed.
+func splitQueryChunks(q string) []string {
+	if len(q) <= intlMaxChunkChars {
+		return []string{q}
+	}
+	n := (len(q) + intlMaxChunkChars - 1) / intlMaxChunkChars
+	if n > intlMaxChunks {
+		n = intlMaxChunks
+	}
+	size := (len(q) + n - 1) / n
+	out := make([]string, 0, n)
+	for i := 0; i < len(q) && len(out) < n; i += size {
+		end := i + size
+		if end >= len(q) {
+			out = append(out, q[i:])
+			break
+		}
+		// walk back to the previous space so we split on a word boundary
+		cut := end
+		for cut > i && q[cut] != ' ' {
+			cut--
+		}
+		if cut <= i {
+			cut = end
+		}
+		out = append(out, q[i:cut])
+		i = cut - size // loop adds size back
+	}
+	return out
+}
+
+// PATCH(local): a session only accepts the next turn once the previous one
+// has been processed. Polling the stored messages is deterministic; blind
+// 409-retrying is not (a turn can take minutes, and a *failed* turn pins the
+// session until it is abandoned).
+//
+// Session statuses observed: in_progress / completed / failed / canceled.
+const (
+	// intlTurnWait bounds how long we wait for one turn to settle.
+	intlTurnWait = 5 * time.Minute
+	// intlTurnPoll is the polling cadence.
+	intlTurnPoll = 3 * time.Second
+)
+
+// sessionTurnState returns the status of the newest message in the session.
+func (c *Client) sessionTurnState(a *Auth, sessionID string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet,
+		c.BaseURL+fmt.Sprintf(EpChatSessionMessages, sessionID), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header = buildHeaders(a)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("session state upstream %d", resp.StatusCode)
+	}
+	var env struct {
+		Data struct {
+			Items []struct {
+				Status string `json:"status"`
+				Role   string `json:"role"`
+			} `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return "", err
+	}
+	if len(env.Data.Items) == 0 {
+		return "", nil
+	}
+	last := env.Data.Items[len(env.Data.Items)-1]
+	return last.Status, nil
+}
+
+// waitForTurnDone blocks until the newest message in the session is no longer
+// in progress, or the deadline passes. Returns the final status.
+func (c *Client) waitForTurnDone(a *Auth, sessionID string) string {
+	deadline := time.Now().Add(intlTurnWait)
+	for {
+		st, err := c.sessionTurnState(a, sessionID)
+		if err == nil {
+			switch st {
+			case "in_progress", "pending", "":
+				// still running (or not yet persisted) — keep waiting
+			default:
+				return st
+			}
+		}
+		if time.Now().After(deadline) {
+			if st == "" {
+				st = "timeout"
+			}
+			log.Printf("trae chat_session %s: turn wait timed out (last state %q)", sessionID, st)
+			return "timeout"
+		}
+		time.Sleep(intlTurnPoll)
+	}
+}
+
+// appendMessage posts one further user turn to an existing session and returns
+// the new message id (the one whose events must be streamed).
+func (c *Client) appendMessage(a *Auth, mode, modelName, strategy, sessionID, query string) (string, error) {
+	body := map[string]any{
+		"chat_session_id":          sessionID,
+		"content":                  []any{},
+		"query":                    query,
+		"model_name":               modelName,
+		"agent_type":               "solo_agent_remote",
+		"model_selection_strategy": strategy,
+		"common_params":            commonParams(a, mode),
+	}
+	raw, _ := json.Marshal(body)
+	req, err := http.NewRequest(http.MethodPost,
+		c.BaseURL+fmt.Sprintf(EpChatSessionMessages, sessionID), bytes.NewReader(raw))
+	if err != nil {
+		return "", err
+	}
+	req.Header = buildHeaders(a)
+	// PATCH(local): wait for the previous turn to settle first. A turn that
+	// ended "failed" still pins the session, so we abandon the whole request
+	// rather than leaving a slot occupied behind us.
+	state := c.waitForTurnDone(a, sessionID)
+	if state == "failed" || state == "canceled" || state == "timeout" {
+		return "", fmt.Errorf("session %s abandoned: previous turn ended %q", sessionID, state)
+	}
+	var respBody []byte
+	status := 0
+	deadline := time.Now().Add(2 * time.Minute)
+	wait := 3 * time.Second
+	for {
+		resp, rerr := c.HTTP.Do(req)
+		if rerr != nil {
+			return "", rerr
+		}
+		respBody, _ = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		status = resp.StatusCode
+		// The session reports "busy" inconsistently: 409/991210 while the
+		// previous turn is still running, and sometimes a bare 500/995000.
+		// Treat both as retryable.
+		busy := status == 409 || status >= 500 ||
+			bytes.Contains(respBody, []byte(`"code":991210`)) ||
+			bytes.Contains(respBody, []byte(`"code":995000`))
+		if !busy {
+			break
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("append_message: session still busy after 4m: %s", truncate(string(respBody), 160))
+		}
+		log.Printf("trae chat_session %s: busy (409), retrying in %s", sessionID, wait)
+		time.Sleep(wait)
+		if wait < 10*time.Second {
+			wait += 2 * time.Second
+		}
+		// rebuild the request body: http.Request is single-use after Do
+		raw2, _ := json.Marshal(body)
+		req, rerr = http.NewRequest(http.MethodPost,
+			c.BaseURL+fmt.Sprintf(EpChatSessionMessages, sessionID), bytes.NewReader(raw2))
+		if rerr != nil {
+			return "", rerr
+		}
+		req.Header = buildHeaders(a)
+	}
+	var env struct {
+		Code int `json:"code"`
+		Data struct {
+			MessageID string `json:"message_id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &env); err != nil {
+		return "", fmt.Errorf("append_message parse: %w", err)
+	}
+	if env.Code != 0 {
+		return "", fmt.Errorf("append_message code=%d: %s", env.Code, truncate(string(respBody), 200))
+	}
+	return env.Data.MessageID, nil
+}
+
 // CreateSession calls POST /chat_sessions to start a new chat.
 // Returns (sessionId, messageId, error).
 func (c *Client) CreateSession(a *Auth, model string, messages []map[string]any) (string, string, error) {
 	mode, strategy, modelName := resolveMode(model)
+
+	// PATCH(local): if this conversation already has a live session, append
+	// only the new turns instead of starting from scratch.
+	convKey := conversationKey(messages)
+	if e := intlSessGet(convKey); e != nil && len(messages) > e.turns {
+		fresh := trailingUserText(messages)
+		if fresh == "" {
+			intlSessDrop(convKey)
+			fresh = flattenQuery(messages)
+		}
+		if state := c.waitForTurnDone(a, e.id); state == "completed" || state == "idle" || state == "" {
+			msgID := ""
+			failed := false
+			for _, chunk := range splitQueryChunks(fresh) {
+				id, aerr := c.appendMessage(a, mode, modelName, strategy, e.id, chunk)
+				if aerr != nil {
+					log.Printf("trae chat_session %s: reuse append failed (%v) — starting a new session", e.id, aerr)
+					intlSessDrop(convKey)
+					failed = true
+					break
+				}
+				msgID = id
+			}
+			if !failed && msgID != "" {
+				intlSessPut(convKey, e.id, len(messages))
+				log.Printf("trae chat_session %s: reused for turn %d (context held)", e.id, len(messages))
+				return e.id, msgID, nil
+			}
+		} else {
+			log.Printf("trae chat_session %s: previous turn ended %q — starting a new session", e.id, state)
+			intlSessDrop(convKey)
+		}
+	}
+
 	query := flattenQuery(messages)
+	// PATCH(local): split BEFORE building the initial message — the first turn
+	// must carry only chunk 0, otherwise it still trips the history size cap.
+	chunks := splitQueryChunks(query)
+	firstChunk := chunks[0]
 	body := map[string]any{
 		"mode":           mode,
 		"environment_id": "default",
 		"initial_message": map[string]any{
 			"chat_session_id":          "",
 			"content":                  []any{},
-			"query":                    query,
+			"query":                    firstChunk,
 			"model_name":               modelName,
 			"agent_type":               "solo_agent_remote",
 			"model_selection_strategy": strategy,
@@ -298,6 +677,28 @@ func (c *Client) CreateSession(a *Auth, model string, messages []map[string]any)
 	}
 	if env.Code != 0 {
 		return "", "", fmt.Errorf("create_session code=%d: %s", env.Code, truncate(string(respBody), 200))
+	}
+	// DEBUG(local): expose the upstream chat_session_id so per-model usage can
+	// be pulled from POST /api/v1/commercial/get_session_usage {session_id}.
+	log.Printf("trae chat_session created: id=%s model=%s msg=%s",
+		env.Data.ChatSessionID, model, env.Data.MessageID)
+
+	// PATCH(local): feed any remaining chunks as further turns so oversized
+	// conversations survive the per-message history cap. The LAST chunk is the
+	// one carrying the actual question, so its message id is what we stream.
+	intlSessPut(convKey, env.Data.ChatSessionID, len(messages))
+	if len(chunks) > 1 {
+		log.Printf("trae chat_session %s: query split into %d messages (%d chars)",
+			env.Data.ChatSessionID, len(chunks), len(query))
+		msgID := env.Data.MessageID
+		for i := 1; i < len(chunks); i++ {
+			id, aerr := c.appendMessage(a, mode, modelName, strategy, env.Data.ChatSessionID, chunks[i])
+			if aerr != nil {
+				return "", "", fmt.Errorf("chunk %d/%d: %w", i+1, len(chunks), aerr)
+			}
+			msgID = id
+		}
+		return env.Data.ChatSessionID, msgID, nil
 	}
 	return env.Data.ChatSessionID, env.Data.MessageID, nil
 }

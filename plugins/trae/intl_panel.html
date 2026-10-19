@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Trae Intl 面板</title>
+<title>Trae Intl panel</title>
 <style>
 /* Theme tokens aligned with CPA management panel (key-policy / themes.scss):
    default :root = light (paper); data-theme=white | dark; embedded iframe syncs parent.
@@ -133,23 +133,23 @@ button .spin{border-color:var(--on-acc);border-top-color:transparent}
 </head>
 <body>
 <div class="wrap">
-  <h1>Trae Intl 账号面板</h1>
-  <div style="margin:4px 0 12px;font-size:13px"><a href="/v0/resource/plugins/trae/panel" style="color:#4a9eff;text-decoration:none">切换到 Trae CN / SOLO 账号面板 →</a><span style="color:var(--mut)">（统一面板：CN / SOLO / Intl 全部账号 · 积分 · 签到）</span></div>
-  <div class="sub">Web SOLO remote 协议（core-normal.trae.ai）· 无签到 · 无积分池 · Token 由 host.auth.refresh 刷新</div>
+  <h1>Trae Intl account panel</h1>
+  <div style="margin:4px 0 12px;font-size:13px"><a href="/v0/resource/plugins/trae/panel" style="color:#4a9eff;text-decoration:none">Switch to the Trae CN / SOLO account panel →</a><span style="color:var(--mut)">(unified panel: all CN / SOLO / Intl accounts · credits · check-in)</span></div>
+  <div class="sub">Web SOLO remote protocol (core-normal.trae.ai) · no check-in · no credit pool · token refreshed by host.auth.refresh</div>
   <div id="authBox" class="card" style="display:none;margin-bottom:16px">
-    <div style="margin-bottom:8px;color:var(--mut)">Trae Intl 插件本身不强制 management key；当 CPA 主面板要求鉴权时，从嵌入环境自动获取。若自动获取失败，可在此手动粘贴 management key（仅存 sessionStorage）。</div>
+    <div style="margin-bottom:8px;color:var(--mut)">The Trae Intl plugin does not itself require a management key; when the CPA main panel requires auth it is picked up automatically from the embedding context. If that fails, paste the management key manually here (stored in sessionStorage only).</div>
     <div style="display:flex;gap:8px">
-      <input id="keyInput" type="password" placeholder="management key（可选）" class="field-input">
-      <button onclick="saveKey()">连接</button>
+      <input id="keyInput" type="password" placeholder="management key (optional)" class="field-input">
+      <button onclick="saveKey()">connect</button>
     </div>
   </div>
   <div class="bar">
-    <button id="refreshBtn" onclick="load(true,this)">刷新数据</button>
-    <button onclick="startOAuthLogin(this)" style="background:var(--acc);color:var(--on-acc);font-weight:600">➕ 登录新账号</button>
+    <button id="refreshBtn" onclick="load(true,this)">Refresh data</button>
+    <button onclick="startOAuthLogin(this)" style="background:var(--acc);color:var(--on-acc);font-weight:600">➕ Sign in new account</button>
     <span class="toggle" id="svtime"></span>
   </div>
   <div class="summary card" id="summaryBox" style="display:none"></div>
-  <div id="grid" class="grid"><div class="loading">加载中…</div></div>
+  <div id="grid" class="grid"><div class="loading">Loading…</div></div>
 </div>
 <div class="toasts" id="toasts"></div>
 <script>
@@ -224,7 +224,7 @@ function toast(title, kind="ok", detail=""){
 }
 function busy(btn, on){
   if(!btn)return;
-  if(on){btn.dataset.orig=btn.innerHTML;btn.disabled=true;btn.innerHTML='<span class="spin"></span>处理中…'}
+  if(on){btn.dataset.orig=btn.innerHTML;btn.disabled=true;btn.innerHTML='<span class="spin"></span>Working…'}
   else{btn.disabled=false;if(btn.dataset.orig)btn.innerHTML=btn.dataset.orig}
 }
 function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
@@ -233,14 +233,14 @@ function escAttr(s){return esc(s)}
 /* Token-expiry classification. trae-intl stores ExpiresAt (unix seconds);
    the /accounts endpoint surfaces it as token_expiry (RFC3339 UTC string). */
 function expiryState(expStr){
-  if(!expStr) return {kind:"none", label:"无过期", cls:"badge"};
+  if(!expStr) return {kind:"none", label:"no expiry", cls:"badge"};
   const t=new Date(expStr).getTime();
-  if(isNaN(t)) return {kind:"none", label:"无过期", cls:"badge"};
+  if(isNaN(t)) return {kind:"none", label:"no expiry", cls:"badge"};
   const now=Date.now();
-  if(t<=now) return {kind:"expired", label:"已过期", cls:"badge err"};
+  if(t<=now) return {kind:"expired", label:"Expired", cls:"badge err"};
   const in24h = t - now < 24*60*60*1000;
-  if(in24h) return {kind:"soon", label:"24h 内过期", cls:"badge warn"};
-  return {kind:"ok", label:"有效", cls:"badge"};
+  if(in24h) return {kind:"soon", label:"Expires within 24h", cls:"badge warn"};
+  return {kind:"ok", label:"valid", cls:"badge"};
 }
 function fmtExpiry(expStr){
   if(!expStr) return "-";
@@ -256,7 +256,7 @@ function card(a){
   const exp=expiryState(a.token_expiry);
   const disabled=!!a.disabled;
   const badges=
-    (disabled?`<span class="badge disabled">已禁用</span>`:"")+
+    (disabled?`<span class="badge disabled">Disabled</span>`:"")+
     (a.region?`<span class="badge region">${esc(a.region)}</span>`:"")+
     `<span class="${exp.cls}" title="${escAttr(fmtExpiry(a.token_expiry))}">${esc(exp.label)}</span>`;
   return `<div class="card" data-auth="${escAttr(a.auth_index)}" data-uid="${escAttr(a.uid)}">
@@ -265,16 +265,16 @@ function card(a){
   <div class="row"><span class="k">UID</span><span class="v">${esc(a.uid||"-")}</span></div>
   ${a.enterprise_id?`<div class="row"><span class="k">Enterprise</span><span class="v">${esc(a.enterprise_id)}</span></div>`:""}
   ${a.region?`<div class="row"><span class="k">Region</span><span class="v">${esc(a.region)}</span></div>`:""}
-  <div class="row"><span class="k">Token 过期</span><span class="v ${exp.kind==='expired'?'err':(exp.kind==='soon'?'warn':'ok')}">${esc(fmtExpiry(a.token_expiry))}</span></div>
-  <div class="row"><span class="k">状态</span><span class="v">${esc(a.status||"-")}</span></div>
-  ${a.error?`<div class="row"><span class="k">错误</span><span class="v err">${esc(a.error)}</span></div>`:""}
+  <div class="row"><span class="k">Token expiry</span><span class="v ${exp.kind==='expired'?'err':(exp.kind==='soon'?'warn':'ok')}">${esc(fmtExpiry(a.token_expiry))}</span></div>
+  <div class="row"><span class="k">Status</span><span class="v">${esc(a.status||"-")}</span></div>
+  ${a.error?`<div class="row"><span class="k">Error</span><span class="v err">${esc(a.error)}</span></div>`:""}
   </div>`;
 }
 async function api(path, opts={}){
   // trae-intl has no plugin-layer key check, so we attempt every call directly.
   // The CPA host middleware is the actual guard; on 401 we surface the key box.
   if(Date.now()<authFailUntil){
-    throw new Error("认证多次失败，请稍后重试（防 IP 封禁）");
+    throw new Error("Authentication failed repeatedly — retry later (IP-ban guard)");
   }
   const k=getKey();
   const r=await fetch(API+path,{...opts,credentials:'omit',headers:{...(opts.headers||{}),...authHeaders(k)}});
@@ -284,9 +284,9 @@ async function api(path, opts={}){
     if(authFailCount>=3){
       authFailUntil=Date.now()+60000;
       authFailCount=0;
-      throw new Error("认证多次失败，请检查管理密钥后 60s 再试");
+      throw new Error("Authentication failed repeatedly — check the management key and retry in 60s");
     }
-    throw new Error("management key 无效或缺失");
+    throw new Error("management key invalid or missing");
   }
   if(r.status===403){
     authFailCount++;
@@ -300,20 +300,20 @@ async function api(path, opts={}){
         waitMs=Math.min(Math.max((mins*60+secs)*1000,30000),30*60*1000);
       }
       authFailUntil=Date.now()+waitMs;
-      throw new Error(body.trim()||"IP 被封禁，请稍后再试");
+      throw new Error(body.trim()||"IP banned, try again later");
     }
     if(authFailCount>=3){authFailUntil=Date.now()+60000;authFailCount=0;}
-    throw new Error(body.trim()||"禁止访问 (403)");
+    throw new Error(body.trim()||"Forbidden (403)");
   }
   authFailCount=0;
   const text=await r.text();
   if(!text){
-    throw new Error(`空响应 (${r.status}) — 路由可能未注册或上游返回空`);
+    throw new Error(`Empty response (${r.status}) — route may be unregistered or upstream returned nothing`);
   }
   try{
     return JSON.parse(text);
   }catch(e){
-    throw new Error(`JSON 解析失败 (${r.status}): ${text.slice(0,100)}`);
+    throw new Error(`JSON parse failed (${r.status}): ${text.slice(0,100)}`);
   }
 }
 async function startOAuthLogin(btn){
@@ -324,15 +324,15 @@ async function startOAuthLogin(btn){
       credentials:"omit",
       headers:authHeaders(k)
     });
-    if(r.status===401){showAuth();throw new Error("management key 无效或缺失");}
+    if(r.status===401){showAuth();throw new Error("management key invalid or missing");}
     if(!r.ok){const t=await r.text();throw new Error("HTTP "+r.status+": "+t.slice(0,160));}
     const d=await r.json();
-    if(!d.url)throw new Error("auth-url 未返回 url");
+    if(!d.url)throw new Error("auth-url did not return a url");
     window.open(d.url,"_blank","noopener");
-    toast("已打开登录页","ok","授权完成后账号会自动出现；若浏览器停在无法连接的 127.0.0.1 页面，把地址栏完整链接粘贴到下方粘贴框完成登录");
+    toast("Sign-in page opened","ok","The account appears automatically once authorized. If the browser stops on a "cannot connect to 127.0.0.1" page, paste the full address-bar URL into the box below to finish.");
     pollOAuthState(d.state);
   }catch(e){
-    toast("发起登录失败","err",e.message);
+    toast("Failed to start sign-in","err",e.message);
   }
   busy(btn,false);
 }
@@ -357,11 +357,11 @@ function pollOAuthState(state){
       const d=await r.json();
       if(d.status==="ok"){
         clearInterval(oauthPollTimer);oauthPollTimer=null;
-        toast("登录成功","ok","凭证已保存");
+        toast("Signed in","ok","Credential saved");
         setTimeout(function(){load(true);},800);
       }else if(d.status==="error"){
         clearInterval(oauthPollTimer);oauthPollTimer=null;
-        toast("登录失败","err",(d.error||"unknown"));
+        toast("Sign-in failed","err",(d.error||"unknown"));
       }
     }catch(e){}
   },3000);
@@ -379,38 +379,38 @@ async function load(force, btn){
     busy(btn, true);
   }
   try{
-    // trae-intl has no /refresh endpoint — "刷新数据" just re-fetches /accounts.
+    // trae-intl has no /refresh endpoint — "Refresh data" just re-fetches /accounts.
     const d = await api("/intl/accounts");
-    document.getElementById("svtime").textContent="服务器时间 "+(d.server_time||"");
+    document.getElementById("svtime").textContent="Server time "+(d.server_time||"");
     if(d.error){
       g.innerHTML='<div class="loading">'+esc(d.error)+"</div>";
-      if(force) toast("刷新失败", "err", d.error);
+      if(force) toast("Refresh failed", "err", d.error);
       return;
     }
     const accounts=d.accounts||[];
     lastAccounts=accounts;
     await loadStatus();
     if(!accounts.length){
-      g.innerHTML='<div class="loading">暂无 '+esc(providerName)+' 账号</div>';
+      g.innerHTML='<div class="loading">No '+esc(providerName)+' account</div>';
       renderSummary([]);
-      if(force) toast("数据已刷新", "warn", "暂无账号");
+      if(force) toast("Data refreshed", "warn", "No accounts");
       return;
     }
     g.innerHTML=accounts.map(card).join("");
     renderSummary(accounts);
     if(force){
       const errN=accounts.filter(a=>a.error).length;
-      let extra=accounts.length+" 个账号";
+      let extra=accounts.length+"  accounts";
       const expired=accounts.filter(a=>expiryState(a.token_expiry).kind==="expired").length;
       const soon=accounts.filter(a=>expiryState(a.token_expiry).kind==="soon").length;
-      if(expired) extra+=" · "+expired+" 个已过期";
-      if(soon) extra+=" · "+soon+" 个将过期";
-      if(errN) extra+=" · "+errN+" 个有错误";
-      if(errN||expired) toast("数据已刷新", "warn", extra);
-      else toast("数据已刷新", "ok", extra);
+      if(expired) extra+=" · "+expired+" expired";
+      if(soon) extra+=" · "+soon+" expiring";
+      if(errN) extra+=" · "+errN+"  with errors";
+      if(errN||expired) toast("Data refreshed", "warn", extra);
+      else toast("Data refreshed", "ok", extra);
     }
   }catch(e){
-    if(force) toast("刷新失败", "err", e.message||String(e));
+    if(force) toast("Refresh failed", "err", e.message||String(e));
     if(!force || !g.querySelector(".card")){
       g.innerHTML='<div class="loading">'+esc(e.message||String(e))+"</div>";
     }
@@ -437,16 +437,16 @@ function renderSummary(accounts){
   box.style.display="block";
   box.innerHTML=`
     <div class="summary-hd">
-      <div class="summary-title">账号汇总 · ${esc(providerName)}</div>
-      <div class="summary-meta">${all.length} 个账号 · 有效 ${ok} · 将过期 ${soon} · 已过期 ${expired} · 禁用 ${disabledN}${errN?(" · 错误 "+errN):""}</div>
+      <div class="summary-title">Account summary · ${esc(providerName)}</div>
+      <div class="summary-meta">${all.length}  accounts · valid ${ok} · expiring ${soon} · expired ${expired} · disabled ${disabledN}${errN?(" · Error "+errN):""}</div>
     </div>
     <div class="summary-grid">
-      <div class="summary-item"><div class="k">账号数</div><div class="v">${all.length}</div></div>
-      <div class="summary-item"><div class="k">Token 有效</div><div class="v ok">${ok}</div></div>
-      <div class="summary-item"><div class="k">24h 内过期</div><div class="v ${soon?"warn":""}">${soon}</div></div>
-      <div class="summary-item"><div class="k">已过期</div><div class="v ${expired?"err":""}">${expired}</div></div>
-      <div class="summary-item"><div class="k">已禁用</div><div class="v ${disabledN?"err":""}">${disabledN}</div></div>
-      <div class="summary-item"><div class="k">Pool</div><div class="v">${st.pool_enabled===false?"无池":"-"}</div></div>
+      <div class="summary-item"><div class="k">Accounts</div><div class="v">${all.length}</div></div>
+      <div class="summary-item"><div class="k">Token valid</div><div class="v ok">${ok}</div></div>
+      <div class="summary-item"><div class="k">Expires within 24h</div><div class="v ${soon?"warn":""}">${soon}</div></div>
+      <div class="summary-item"><div class="k">Expired</div><div class="v ${expired?"err":""}">${expired}</div></div>
+      <div class="summary-item"><div class="k">Disabled</div><div class="v ${disabledN?"err":""}">${disabledN}</div></div>
+      <div class="summary-item"><div class="k">Pool</div><div class="v">${st.pool_enabled===false?"no pool":"-"}</div></div>
     </div>
   `;
 }
