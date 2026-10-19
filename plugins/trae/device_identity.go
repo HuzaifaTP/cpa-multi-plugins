@@ -203,10 +203,22 @@ func applyDerivedIdentityIntl(lc *intlloginCtx, uid string) {
 	if id == nil {
 		return
 	}
-	lc.deviceID, lc.machineID = id.DeviceID, id.MachineID
-	lc.devicePublicKey, lc.devicePrivateKey = id.DevicePublicKey, id.DevicePrivateKey
-	log.Printf("trae-intl login: per-account device identity derived (uid=%s deviceId=%s machineId=%s)",
-		strings.TrimSpace(uid), id.DeviceID, id.MachineID)
+	// PATCH(local): do NOT swap the device identity here.
+	//
+	// The verification URI handed to www.trae.ai at start-login already
+	// carried the login device id (device_id / x_device_id / machine_id) and
+	// that is the device the authCode gets bound to server-side. Overwriting
+	// lc.deviceID / lc.machineID / the EC key pair at the callback made
+	// ExchangeToken present a DIFFERENT device than the one that authorised,
+	// which the server rejects with:
+	//
+	//   HTTP 401 upstream code=20403 (Token device not match.)
+	//
+	// The derived per-account identity is still computed (and logged) so it
+	// stays available for diagnostics, but the exchange and the persisted
+	// credential must keep the authorize-time identity.
+	log.Printf("trae-intl login: per-account device identity observed, NOT applied (uid=%s deviceId=%s machineId=%s; keeping authorize-time device=%s)",
+		strings.TrimSpace(uid), id.DeviceID, id.MachineID, lc.deviceID)
 }
 
 // persistDeviceIdentity writes the identity atomically (heal.go

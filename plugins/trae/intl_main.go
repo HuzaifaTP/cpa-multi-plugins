@@ -329,9 +329,30 @@ func intlmodelCatalogForAuth(storageJSON []byte, authID string, a *upstream.Auth
 //   gpt-6-sol / gpt-6-luna / gpt-6.1-sol → recognised but produce zero
 //   completion tokens (Pro-gated); listing them would advertise a dead model.
 func intlExtendedCatalog() []upstream.ModelMeta {
+	// PATCH(local): every entry here must belong to the **solo_agent_remote**
+	// function — that is the lane this plugin creates chat_sessions on
+	// (agent_type=solo_agent_remote in CreateSession). Trae resolves a model by
+	// (Function, ConfigName); a name that exists only in another lane (e.g.
+	// solo_agent) fails at execute time with:
+	//
+	//   4001: config item is empty for config opt:
+	//         {"Function":"solo_agent_remote","ConfigName":"glm-5.2",...}
+	//
+	// Verified live 2026-10-19 against an Intl credential:
+	//   deepseek-v4-pro-0813 -> works ("I am TraeCode's AI assistant.")
+	//   gpt-6-sol            -> 1005 (routable, that model's quota is spent)
+	//   glm-5.2 / gpt-5.5    -> 4001 (not present in solo_agent_remote)
+	//
+	// The desktop client's 22-model catalog spans several lanes; only the
+	// solo_agent_remote subset is reachable from here.
 	return []upstream.ModelMeta{
 		{Name: "kimi-k3", DisplayName: "Kimi-K3"},
 		{Name: "minimax-m3", DisplayName: "MiniMax-M3"},
+		{Name: "deepseek-v4.1-flash", DisplayName: "DeepSeek-V4.1-Flash"},
+		{Name: "deepseek-v4-pro-0813", DisplayName: "DeepSeek-V4-Pro"},
+		{Name: "gpt-6.1-sol", DisplayName: "GPT-6.1-Sol"},
+		{Name: "gpt-6-sol", DisplayName: "GPT-6-Sol"},
+		{Name: "gpt-6-luna", DisplayName: "GPT-6-Luna"},
 	}
 }
 
