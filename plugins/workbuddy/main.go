@@ -348,7 +348,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.9.60"
+var version = "0.9.61"
 
 func wbRegistration() registration {
 	return registration{
@@ -614,20 +614,30 @@ func backendHeaders(req *http.Request, sa *storedAuth) {
 		req.Header.Set("X-IDE-Type", "WorkBuddy")
 		req.Header.Set("X-IDE-Version", "5.5.6")
 	}
-	// 2026-10-19 (issue #40 follow-up): the Global realm's gateway rejects
-	// otherwise-valid streaming chat calls with 11128 "request illegal"
-	// ("This call failed channel verification, possibly because it was not
-	// sent from an official client") unless the request carries the desktop
-	// client's three conversation-correlation headers. The token, body and
-	// every other header in the A/B runs were identical — adding these three
-	// turned 11128 into 200. CN and Intl realms do not check them, so this is
-	// scoped to Global to keep CN traffic byte-identical. Per-request random
-	// ids are accepted: the gateway validates presence/shape only.
-	if isGlobalDomain(sa.Auth.Domain) {
-		for _, h := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID"} {
-			if req.Header.Get(h) == "" {
-				req.Header.Set(h, growthClientToken())
-			}
+	// 2026-10-19 (PR #43): the Global realm's gateway rejects otherwise-valid
+	// streaming chat calls with 11128 "request illegal" ("This call failed
+	// channel verification, possibly because it was not sent from an official
+	// client") unless the request carries the desktop client's three
+	// conversation-correlation headers. The token, body and every other
+	// header in the A/B runs were identical — adding these three turned
+	// 11128 into 200.
+	// 2026-10-19 later the same day (issue #44): the Intl gateway joined the
+	// wave with its own copy ("Request blocked. Please send it again" /
+	// 「请求被拦截，请重新发送」); extending the same blank-only fill to
+	// isIntlDomain restored 200/finish_reason=stop on a user-first probe.
+	// 2026-10-20/21 (issue #45): CN domestic users report the same family
+	// hitting both realms at once. The official desktop client sends this
+	// header family on EVERY build — including CN copilot.tencent.com, as
+	// field-documented by the mcplugins reference implementation (which ships
+	// them on the CN build in production) — and our own growth task_chat path
+	// has always carried X-Conversation-ID on CN endpoints. The fill is
+	// therefore realm-unconditional now, still blank-only: caller-supplied
+	// ids survive, so task_chat's wb-task-* conversation ids and any preset
+	// header keep their values. Per-request random ids are accepted: the
+	// gateways validate presence/shape, not cross-turn continuity.
+	for _, h := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID"} {
+		if req.Header.Get(h) == "" {
+			req.Header.Set(h, growthClientToken())
 		}
 	}
 

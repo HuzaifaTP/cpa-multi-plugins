@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.9.61
+
+### The 11128 conversation-header wave goes realm-unconditional (issues #44, #45; extends PR #43)
+
+PR #43 (merged as-is in v0.8.73) fixed the Global realm: the
+www.workbuddy.ai gateway started rejecting otherwise-valid streaming chat
+calls with `11128 "request illegal"` unless the request carries the
+desktop client's three conversation-correlation headers
+(`X-Conversation-ID` / `X-Conversation-Request-ID` /
+`X-Conversation-Message-ID`). This release extends the same blank-only
+fill to the other two realms, because the wave did not stay Global:
+
+- **Intl (issue #44, field evidence by sciman-top)**: the same day
+  (2026-10-19 12:29 UTC) `www.codebuddy.ai` joined with its own displayMsg
+  copy ("Request blocked. Please send it again" / 「请求被拦截，请重新发送」).
+  The exclusion matrix (host version, plugin version, lineage, content,
+  credential) ruled out everything but the gateway; applying the same two
+  condition-line extension restored `200 / finish_reason=stop` on the
+  exact probe that had failed all morning, stable in production since.
+- **CN (issue #45)**: domestic users report 「国内国际版本均不可用」 from
+  2026-10-20 evening. The official desktop client sends this header family
+  on every build — including CN copilot.tencent.com, as field-documented
+  by the mcplugins reference implementation, which ships them on the CN
+  build in production — and our own growth task_chat path has always
+  carried `X-Conversation-ID` on CN endpoints. The fill is therefore
+  realm-unconditional (CN default / empty legacy domains included).
+
+Semantics are unchanged from #43: blank-only fill, per-request fresh
+UUID-shaped ids, caller-supplied ids preserved (task_chat's `wb-task-*`
+conversation ids and the two sibling headers still fill around them).
+Per sciman-top's nits, the outdated "CN and Intl realms do not check
+them" comment/doc wording is gone, and the test now pins all three
+realms plus the legacy empty-domain case on both the fill and the
+preservation paths.
+
 ## 0.9.60
 
 ### Hermetic Intl billing test (issue #39 CI follow-up)
