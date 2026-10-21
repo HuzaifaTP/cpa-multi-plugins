@@ -16,7 +16,7 @@
       "linux-arm64": "https://github.com/mmqz/cpa-multi-plugins/releases/latest/download/cpa-multi-plugins-split-linux-arm64.zip",
       "windows-amd64": "https://github.com/mmqz/cpa-multi-plugins/releases/latest/download/cpa-multi-plugins-split-windows-amd64.zip"
     },
-    "note": "Each zip bundles all five plugins for that platform; the 'releases/latest/download' URLs always resolve to the newest tagged release. The split package carries the legacy per-variant plugin ids (codebuddy-cn, trae-solo-cn, ...) — install it INSTEAD OF, not next to, the unified plugin of the same provider."
+    "note": "Each unified zip bundles all five plugins for that platform; the 'releases/latest/download' URLs always resolve to the newest tagged release. For the CLIProxyAPI plugin store (install/update per plugin from the management panel) each release additionally carries per-plugin zips named '{plugin_id}_{version}_{goos}_{goarch}.zip' plus a checksums.txt — the store resolves them from each plugin's repository field automatically. The split package carries the legacy per-variant plugin ids (codebuddy-cn, trae-solo-cn, ...) — install it INSTEAD OF, not next to, the unified plugin of the same provider."
   },
   "plugins": [
     {

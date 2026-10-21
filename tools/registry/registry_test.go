@@ -260,3 +260,41 @@ func keys(m map[string]string) []string {
 var colonSpaceRe = regexp.MustCompile(`:\s*`)
 
 func normalizeJSON(s string) string { return colonSpaceRe.ReplaceAllString(s, ":") }
+
+// TestReleaseWorkflowCarriesStoreAssets pins the CPA plugin-store asset
+// contract (v0.8.74, #39 field report): the CLIProxyAPI store client resolves
+// each plugin's repository -> latest release -> asset named
+// {plugin_id}_{release_version}_{goos}_{goarch}.zip plus a checksums.txt
+// sibling, with exactly one dynamic library at zip root. A release workflow
+// edit that silently drops the packaging step, renames the template, or stops
+// uploading checksums.txt re-breaks every store install with a 502
+// "release asset ... not found" — this guard fails the build instead.
+func TestReleaseWorkflowCarriesStoreAssets(t *testing.T) {
+	reg, regPath := loadOrFail(t)
+	root := filepath.Dir(regPath)
+	data, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatalf("read release.yml: %v", err)
+	}
+	wf := string(data)
+	for _, marker := range []string{
+		"Package per-plugin store zips + checksums.txt", // the packaging step
+		`"${id}_${TAGVER}_${goos}_${goarch}.zip"`,       // the store asset naming template
+		"sha256sum *.zip > checksums.txt",               // checksums.txt generation
+		"release/checksums.txt",                         // checksums.txt uploaded as a release asset
+		"TAGVER=\"${TAGVER#v}\"",                        // asset version = release tag without the v
+		`plat="${plat%.zip}"`,                           // dry-run catch: the glob keeps the .zip suffix — without this the store zips become name.zip.zip
+	} {
+		if !strings.Contains(wf, marker) {
+			t.Errorf("release.yml lost the plugin-store asset contract marker %q", marker)
+		}
+	}
+	// The store routes installs through each plugin's repository field; it
+	// must stay exactly https://github.com/{this repo} (CPA rejects anything
+	// else for github-release installs).
+	for _, e := range reg.Plugins {
+		if e.Repository != "https://github.com/mmqz/cpa-multi-plugins" {
+			t.Errorf("plugins[%s].repository = %q, want https://github.com/mmqz/cpa-multi-plugins", e.ID, e.Repository)
+		}
+	}
+}

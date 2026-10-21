@@ -19,7 +19,15 @@ Tagged commits are built by CI; per-platform artifacts are attached to each [rel
 
 - per-plugin `version` (kept in lockstep with each `plugins/<id>/VERSION` by CI guards), `changelog` one-liner for the update prompt, `platforms`, and `split_channels` for the legacy per-variant ids;
 - top-level `downloads.unified` / `downloads.split` with stable `releases/latest/download/<asset>.zip` URLs for all five platforms — every zip bundles all five plugins;
-- `homepage` / `repository` / `license` / `tags` for store listing metadata.
+- `homepage` / `repository` / `license` / `tags` for store listing metadata;
+- **CLIProxyAPI plugin store**: since v0.8.74 every release also carries per-plugin zips named `{plugin_id}_{version}_{goos}_{goarch}.zip` (exactly one dynamic library at zip root) plus a `checksums.txt` — the naming and layout the CPA store client resolves from the `repository` field. Add the registry as a store source and install/update plugins individually from the management panel:
+
+  ```yaml
+  plugins:
+    enabled: true
+    store-sources:
+      - "https://raw.githubusercontent.com/mmqz/cpa-multi-plugins/main/registry.json"
+  ```
 
 Version bumps are one command — `cd tools/registry && go run . sync` rewrites the registry versions and this README's table from `plugins/*/VERSION`; the lockstep guards (`go test ./...` in the same directory, wired into the CI `test` job) keep a half-synced registry out of main.
 

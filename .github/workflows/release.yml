@@ -339,6 +339,42 @@ jobs:
           fi
         shell: bash
 
+      # CPA plugin store assets (#39 field report, 2026-10-21): the
+      # CLIProxyAPI plugin store installs ONE plugin per release asset. Its
+      # client resolves the plugin's `repository` -> latest release ->
+      # asset named {plugin_id}_{release_version}_{goos}_{goarch}.zip plus a
+      # sibling checksums.txt (sha256sum format), and requires the zip to
+      # contain exactly ONE dynamic library at zip root. The aggregate
+      # bundles serve manual installs; these per-plugin zips serve the
+      # store's install/update path. Before this step the store 502'd with
+      # "plugin_install_failed: release asset qoder_0.8.72_windows_amd64.zip
+      # not found" because no such asset had ever existed.
+      - name: Package per-plugin store zips + checksums.txt
+        run: |
+          TAGVER="${{ steps.version.outputs.version }}"
+          TAGVER="${TAGVER#v}"
+          echo "store asset version: $TAGVER"
+          cd release
+          for agg in cpa-multi-plugins-*.zip; do
+            case "$agg" in *split*) continue ;; esac
+            plat="${agg#cpa-multi-plugins-}"        # e.g. linux-amd64.zip
+            plat="${plat%.zip}"                     # → linux-amd64 (dry-run caught the .zip leak)
+            goos="${plat%-*}"; goarch="${plat##*-}"
+            tmp="$(mktemp -d)"
+            unzip -q -o "$agg" -d "$tmp"
+            for lib in "$tmp"/*.so "$tmp"/*.dll "$tmp"/*.dylib; do
+              [ -f "$lib" ] || continue
+              id="$(basename "$lib")"; id="${id%.*}"
+              zip -q -j "${id}_${TAGVER}_${goos}_${goarch}.zip" "$lib"
+            done
+            rm -rf "$tmp"
+          done
+          rm -f checksums.txt
+          sha256sum *.zip > checksums.txt
+          echo "=== store assets ==="
+          cat checksums.txt
+        shell: bash
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -357,6 +393,16 @@ jobs:
             - `cpa-multi-plugins-darwin-arm64.zip` — macOS Apple Silicon
             - `cpa-multi-plugins-darwin-amd64.zip` — macOS Intel (cross-built on an arm64 runner)
             - `cpa-multi-plugins-windows-amd64.zip` — Windows x86_64
+
+            ### CPA Plugin Store (v0.8.74+)
+            Each release also carries per-plugin store zips named `{plugin_id}_{version}_{goos}_{goarch}.zip` (one dynamic library at zip root) plus a `checksums.txt` — exactly what the CLIProxyAPI plugin store's install/update path resolves. Add this repo's registry as a store source and install/update per plugin from the management panel:
+
+            ```yaml
+            plugins:
+              enabled: true
+              store-sources:
+                - "https://raw.githubusercontent.com/mmqz/cpa-multi-plugins/main/registry.json"
+            ```
 
             ### Split-channel package (issue #29)
             Same platform list with a `cpa-multi-plugins-split-<os>-<arch>.zip` each. Contains the legacy **per-variant plugins** — `codebuddy-cn`, `codebuddy-intl`, `qoder-cn`, `qoder-intl`, `trae-cn`, `trae-solo-cn`, `trae-intl` — each with its own panel entry and its own OAuth login pinned to its realm. Install INSTEAD of (not next to) the unified plugin of the same provider; enable them in config.yaml by their own ids (`plugins.configs.codebuddy-intl.enabled: true`, …).
@@ -389,6 +435,8 @@ jobs:
             | mimo | Xiaomi MiMo (mimocode CLI + desktop parity) | CN / SGP / RU / IN (mimo-server-<region>.xiaomimimo.com) | sk OAuth (permanent) + desktop SSO cookie adoption, per-account region |
 
             See [README](https://github.com/mmqz/cpa-multi-plugins#readme) for details.
-          files: release/*.zip
+          files: |
+            release/*.zip
+            release/checksums.txt
           draft: false
           prerelease: false
