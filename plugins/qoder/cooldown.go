@@ -317,6 +317,16 @@ func recordUpstreamFailure(authID, model string, status int, body string) {
 		markModelCooldown(authID, model, cooldownReasonRateLimit)
 		return
 	}
+	// v0.8.64: a 10605 RESOURCE_LIMIT queue ticket that survived the chat
+	// path's own retry rounds means the model is still saturated. Cool the
+	// pair briefly (60s, the unknown cadence — one ticket interval) so the
+	// scheduler prefers other models/credentials, instead of hammering the
+	// same queue. Account-wide cooling would be wrong: other models on the
+	// same credential are unaffected by a per-model queue.
+	if isQueueLimitFailure(body) {
+		markModelCooldown(authID, model, cooldownReasonUnknown)
+		return
+	}
 	if status == 429 || isSoftRateLimit(status, body) {
 		markModelCooldown(authID, model, cooldownReasonRateLimit)
 		return
@@ -341,6 +351,14 @@ func isEmptyStreamFailure(body string) bool {
 // empty_stream.
 func isPlanGateFailure(body string) bool {
 	return strings.Contains(body, "plan_gate")
+}
+
+// isQueueLimitFailure reports the 10605 RESOURCE_LIMIT queue family
+// (v0.8.64). The "queue_limit" marker is stamped by queueLimitLine, which
+// describeQoderEnvelopeRejection and chatUpstreamError both route through, so
+// every terminal rendering of a queue ticket lands here.
+func isQueueLimitFailure(body string) bool {
+	return strings.Contains(body, queueMarker)
 }
 
 // handleCooldownList reports every active pair, or one account's pairs when

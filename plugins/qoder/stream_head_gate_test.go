@@ -167,13 +167,17 @@ func newQoderSSEServer(t *testing.T, status int, body string) *httptest.Server {
 }
 
 // runPump drives the real async pump against url. gate == nil is the disabled
-// configuration (stream_head_timeout: 0).
+// configuration (stream_head_timeout: 0). rebuild re-issues the request for
+// v0.8.64 queue-ticket retries (nil disables retry — none of the gate tests
+// exercise a queue ticket).
 func runPump(url string, gate *streamHeadGate) {
 	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader("encoded-body"))
 	if err != nil {
 		panic(err)
 	}
-	pumpUpstreamStream(req, nil, "stream-head-gate", false,
+	pumpUpstreamStream(req, func() (*http.Request, error) {
+		return http.NewRequest(http.MethodPost, url, strings.NewReader("encoded-body"))
+	}, nil, "stream-head-gate", false,
 		"qmodel_preview", "qmodel_preview", "", time.Now(), "", "", gate)
 }
 

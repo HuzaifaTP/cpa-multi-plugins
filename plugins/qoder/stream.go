@@ -116,6 +116,12 @@ type qoderFrameError struct {
 	// (an {"error":...} body inside a 200-OK envelope, or a bare event:error
 	// line), which is not the same thing as "the upstream said 200".
 	status int
+	// queued is non-nil when the rejection was a 10605 RESOURCE_LIMIT queue
+	// ticket (v0.8.64): the chat paths retry those instead of failing. The
+	// signal travels on the error because the retry decision is made above
+	// qoderUnwrapFrame, where the caller knows whether anything was already
+	// delivered to the client.
+	queued *queueSignal
 }
 
 func (e *qoderFrameError) Error() string { return e.msg }
@@ -311,7 +317,16 @@ func streamChunkAnswers(chunk string) bool {
 // non-nil gate and blocks in awaitHandoff until the pump reports. Until then
 // this function reads without emitting (see release below). gate == nil — the
 // default, stream_head_timeout 0 — keeps the historical behavior byte for byte.
-func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, streamID string, sseFramed bool, requestedModel, upstreamModel, authUID string, started time.Time, authID, cooldownModel string, gate *streamHeadGate) {
+//
+// v0.8.64 queue retry: rebuild re-issues the upstream request (fresh body
+// reader + re-signed cosy headers) for the 10605 RESOURCE_LIMIT ticket, which
+// the gateway hands back asking the client to return after retryAfterSeconds.
+// A ticket can arrive either as the HTTP status or as the first SSE frame;
+// both are recognised before anything was delivered to the client, so the
+// retry is invisible to the consumer. The gate keeps waiting across rounds —
+// its one-shot verdict slot is still untouched by a queue ticket, so the
+// eventual round reports through exactly the same paths as before.
+func pumpUpstreamStream(httpReq *http.Request, rebuild func() (*http.Request, error), cancel context.CancelFunc, streamID string, sseFramed bool, requestedModel, upstreamModel, authUID string, started time.Time, authID, cooldownModel string, gate *streamHeadGate) {
 	// Always close the host stream exactly once on every exit path.
 	closed := false
 	closeOnce := func() {
@@ -326,227 +341,332 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 		defer cancel()
 	}
 
-	stream, statusCode, _, err := hostHTTPDoStream(httpReq)
-	if err != nil {
-		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
-		// Deliberately not gated: no status came back and a client-side context
-		// cancellation reads exactly like an upstream outage, so the hand-off
-		// must not cool a credential on it. Release keeps the waiting
-		// hand-off from burning the whole window on a dead stream.
-		gate.release()
-		streamErrorSink(streamID, fmt.Sprintf("http_error: %v", err))
-		return
-	}
-	defer stream.Close()
+	// v0.8.64: queue-ticket bookkeeping shared by every round below.
+	var waited time.Duration
+	attempt := 0
+	for {
+		sig, retry := func() (queueSignal, bool) {
+			stream, statusCode, _, err := hostHTTPDoStream(httpReq)
+			if err != nil {
+				publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
+				// Deliberately not gated: no status came back and a client-side context
+				// cancellation reads exactly like an upstream outage, so the hand-off
+				// must not cool a credential on it. Release keeps the waiting
+				// hand-off from burning the whole window on a dead stream.
+				gate.release()
+				streamErrorSink(streamID, fmt.Sprintf("http_error: %v", err))
+				return queueSignal{}, false
+			}
+			defer stream.Close()
 
-	// head buffers the chunks read before the gate resolved; always empty when
-	// the gate is off. release ends the head phase exactly once: the hand-off is
-	// told no failure envelope is possible any more, then the buffered frames go
-	// out, so the client sees the same bytes in the same order as the ungated
-	// pump. It returns the first emit failure, which every caller reports as
-	// "stream_emit: ..." and aborts on (client disconnected).
-	var head [][]byte
-	released := gate == nil
-	release := func() error {
-		if released {
-			return nil
-		}
-		released = true
-		gate.release()
-		var errEmit error
-		for _, payload := range head {
-			if errEmit = streamEmitSink(streamID, payload); errEmit != nil {
-				break
+			// head buffers the chunks read before the gate resolved; always empty when
+			// the gate is off. release ends the head phase exactly once: the hand-off is
+			// told no failure envelope is possible any more, then the buffered frames go
+			// out, so the client sees the same bytes in the same order as the ungated
+			// pump. It returns the first emit failure, which every caller reports as
+			// "stream_emit: ..." and aborts on (client disconnected).
+			var head [][]byte
+			released := gate == nil
+			release := func() error {
+				if released {
+					return nil
+				}
+				released = true
+				gate.release()
+				var errEmit error
+				for _, payload := range head {
+					if errEmit = streamEmitSink(streamID, payload); errEmit != nil {
+						break
+					}
+				}
+				head = nil
+				return errEmit
 			}
-		}
-		head = nil
-		return errEmit
-	}
-	// fail reports an upstream failure that surfaced after the response opened.
-	// It returns true when the hand-off took the failure back as an envelope —
-	// nothing was delivered, so the pump must not emit for this call any more.
-	// Otherwise the buffered head frames go out first and the terminal error
-	// stays in-band, exactly as it has been since v0.8.17.
-	fail := func(status int, cause error) bool {
-		if !released && gate.abort(headGateStatus(status), cause) {
-			return true
-		}
-		// An emit failure here means the client is already gone; the in-band
-		// terminal error below fails the same way it always has.
-		_ = release()
-		streamErrorSink(streamID, cause.Error())
-		return false
-	}
+			// fail reports an upstream failure that surfaced after the response opened.
+			// It returns true when the hand-off took the failure back as an envelope —
+			// nothing was delivered, so the pump must not emit for this call any more.
+			// Otherwise the buffered head frames go out first and the terminal error
+			// stays in-band, exactly as it has been since v0.8.17.
+			fail := func(status int, cause error) bool {
+				if !released && gate.abort(headGateStatus(status), cause) {
+					return true
+				}
+				// An emit failure here means the client is already gone; the in-band
+				// terminal error below fails the same way it always has.
+				_ = release()
+				streamErrorSink(streamID, cause.Error())
+				return false
+			}
+			// reportQueueExhausted closes out a queue ticket the retry budget could
+			// not clear: the terminal error is the actionable queue line (with the
+			// queue_limit marker the cooldown classifier keys on), the failure is
+			// recorded once — after the retries, not per round — and the gate (when
+			// armed) receives the ticket's own status.
+			reportQueueExhausted := func(sig queueSignal) {
+				msg := fmt.Sprintf("qoder upstream error: %s", queueExhaustedLine(sig, attempt, waited))
+				frameErr := &qoderFrameError{msg: msg, status: sig.status, queued: &sig}
+				publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, 0, msg)
+				if authID != "" {
+					recordUpstreamFailure(authID, cooldownModel, 0, msg)
+				}
+				fail(headGateStatus(sig.status), frameErr)
+			}
 
-	if statusCode >= 400 {
-		// Drain the error body via the same bridge so the message is complete.
-		errPayload, _ := io.ReadAll(newHostStreamReader(stream))
-		upstreamErr := chatUpstreamError(statusCode, string(errPayload))
-		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(errPayload))
-		if authID != "" {
-			recordUpstreamFailure(authID, cooldownModel, statusCode, string(errPayload))
-		}
-		if authUID != "" {
-			go reconcileByUID(authUID, statusCode, string(errPayload))
-		}
-		// Nothing was delivered, so with the gate open the host gets the real
-		// upstream status here instead of an in-band text error behind a 200.
-		fail(statusCode, upstreamErr)
-		return
-	}
-	collector := &sseUsageCollector{}
-	scanner := bufio.NewScanner(newHostStreamReader(stream))
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	seenPayload := false
-	for scanner.Scan() {
-		bodyStr, meaningful, frameErr := qoderUnwrapFrame(scanner.Text())
-		if frameErr != nil {
-			publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, frameErr.Error())
-			// v0.12.76: envelope errors also feed the cooldown table — every
-			// other failure site does; without this a streaming-path 429
-			// envelope never cools the (auth, model) pair. The literal 0 is
-			// unchanged on purpose even though the frame may carry a status:
-			// the cooldown classifier keys on the message body, and starting to
-			// pass a status through would change how long existing deployments
-			// cool the pair on the paths that have always had this guard.
-			if authID != "" {
-				recordUpstreamFailure(authID, cooldownModel, 0, frameErr.Error())
+			if statusCode >= 400 {
+				// Drain the error body via the same bridge so the message is complete.
+				errPayload, _ := io.ReadAll(newHostStreamReader(stream))
+				// v0.8.64: a 10605 queue ticket at the HTTP layer is a retry signal,
+				// not a failure — nothing has been delivered yet by construction.
+				if sig := parseQueueSignal(string(errPayload)); sig.detected {
+					sig.status = statusCode
+					if queueRetryAllowed(attempt, waited, sig.retryAfter) {
+						return sig, true
+					}
+					reportQueueExhausted(sig)
+					return queueSignal{}, false
+				}
+				upstreamErr := chatUpstreamError(statusCode, string(errPayload))
+				publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(errPayload))
+				if authID != "" {
+					recordUpstreamFailure(authID, cooldownModel, statusCode, string(errPayload))
+				}
+				if authUID != "" {
+					go reconcileByUID(authUID, statusCode, string(errPayload))
+				}
+				// Nothing was delivered, so with the gate open the host gets the real
+				// upstream status here instead of an in-band text error behind a 200.
+				fail(statusCode, upstreamErr)
+				return queueSignal{}, false
 			}
-			// A frame-carried failure before the first answer is exactly what
-			// the gate exists for: statusCodeValue>=400 envelopes report their
-			// own number, the rest fall back to 502 (see headGateStatus).
-			fail(frameGateStatus(frameErr), frameErr)
-			return
-		}
-		seenPayload = seenPayload || meaningful
-		if bodyStr == "" || bodyStr == "[DONE]" {
-			continue
-		}
-		collector.feed(bodyStr)
-		cleaned := cleanChunkJSON(bodyStr)
-		if cleaned == "" {
-			continue
-		}
-		outgoing := []byte(cleaned)
-		if sseFramed {
-			outgoing = []byte("data: " + cleaned)
-		}
-		if !released {
-			head = append(head, outgoing)
-			// Hold the head open until a frame really starts answering: a
-			// role-only opener must keep a later failure reportable.
-			if !streamChunkAnswers(cleaned) {
-				continue
+			collector := &sseUsageCollector{}
+			scanner := bufio.NewScanner(newHostStreamReader(stream))
+			scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+			seenPayload := false
+			for scanner.Scan() {
+				bodyStr, meaningful, frameErr := qoderUnwrapFrame(scanner.Text())
+				if frameErr != nil {
+					// v0.8.64: a queue ticket that rode a 200-OK envelope frame. Only
+					// retry while nothing was delivered: the ticket is a first-frame
+					// rejection by nature, and seenPayload (not the gate's released
+					// flag) is the delivery witness that is correct with the gate off
+					// too — an emit-less first frame leaves it false.
+					var fe *qoderFrameError
+					if errors.As(frameErr, &fe) && fe.queued != nil && !seenPayload {
+						if queueRetryAllowed(attempt, waited, fe.queued.retryAfter) {
+							return *fe.queued, true
+						}
+						reportQueueExhausted(*fe.queued)
+						return queueSignal{}, false
+					}
+					publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, frameErr.Error())
+					// v0.12.76: envelope errors also feed the cooldown table — every
+					// other failure site does; without this a streaming-path 429
+					// envelope never cools the (auth, model) pair. The literal 0 is
+					// unchanged on purpose even though the frame may carry a status:
+					// the cooldown classifier keys on the message body, and starting to
+					// pass a status through would change how long existing deployments
+					// cool the pair on the paths that have always had this guard.
+					if authID != "" {
+						recordUpstreamFailure(authID, cooldownModel, 0, frameErr.Error())
+					}
+					// A frame-carried failure before the first answer is exactly what
+					// the gate exists for: statusCodeValue>=400 envelopes report their
+					// own number, the rest fall back to 502 (see headGateStatus).
+					fail(frameGateStatus(frameErr), frameErr)
+					return queueSignal{}, false
+				}
+				seenPayload = seenPayload || meaningful
+				if bodyStr == "" || bodyStr == "[DONE]" {
+					continue
+				}
+				collector.feed(bodyStr)
+				cleaned := cleanChunkJSON(bodyStr)
+				if cleaned == "" {
+					continue
+				}
+				outgoing := []byte(cleaned)
+				if sseFramed {
+					outgoing = []byte("data: " + cleaned)
+				}
+				if !released {
+					head = append(head, outgoing)
+					// Hold the head open until a frame really starts answering: a
+					// role-only opener must keep a later failure reportable.
+					if !streamChunkAnswers(cleaned) {
+						continue
+					}
+					if err := release(); err != nil {
+						publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, "stream_emit: "+err.Error())
+						return queueSignal{}, false
+					}
+					continue
+				}
+				if err := streamEmitSink(streamID, outgoing); err != nil {
+					// Client disconnected / host closed stream — abort; do not report success.
+					publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, "stream_emit: "+err.Error())
+					return queueSignal{}, false
+				}
 			}
+			// Flush whatever the head phase buffered before judging the outcome: a
+			// stream that ended after a role-only opener still owes the client that
+			// opener, exactly as the ungated pump delivered it.
 			if err := release(); err != nil {
 				publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, "stream_emit: "+err.Error())
-				return
+				return queueSignal{}, false
 			}
-			continue
-		}
-		if err := streamEmitSink(streamID, outgoing); err != nil {
-			// Client disconnected / host closed stream — abort; do not report success.
-			publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, "stream_emit: "+err.Error())
+			// A mid-stream read failure means the client received a truncated stream:
+			// surface it as an error frame and record the attempt as failed.
+			if err := scanner.Err(); err != nil {
+				publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, err.Error())
+				if authID != "" {
+					recordUpstreamFailure(authID, cooldownModel, 0, err.Error())
+				}
+				// Deliberately not gated: empty-stream and read failures stay in-band
+				// even when the gate is open. The headGateStatus table would turn a
+				// guessed 502 into a hard failure, and policy.go keeps this "unexpected
+				// EOF" wording status-less on purpose so CPA treats a dropped stream as
+				// transport lifecycle instead of cooling the credential.
+				streamErrorSink(streamID, fmt.Sprintf("upstream stream read error: %v", err))
+				return queueSignal{}, false
+			}
+			// v0.8.18: the async pump finally gets the same empty-stream guard the
+			// synchronous collector has had since v0.8.17 — a 200 envelope stream
+			// with zero payload is an upstream failure, not a silent success. (The
+			// seenPayload tracking used to be dead code here.) Same lifecycle reasoning
+			// as above: no hand-off abort, the message stays in-band.
+			if !seenPayload {
+				errEmpty := emptyStreamError()
+				publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, errEmpty.Error())
+				if authID != "" {
+					recordUpstreamFailure(authID, cooldownModel, 0, errEmpty.Error())
+				}
+				streamErrorSink(streamID, errEmpty.Error())
+				return queueSignal{}, false
+			}
+			publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), false, 0, "")
+			invalidateAccountCredits(authID, authUID)
+			return queueSignal{}, false
+		}()
+		if !retry {
 			return
 		}
-	}
-	// Flush whatever the head phase buffered before judging the outcome: a
-	// stream that ended after a role-only opener still owes the client that
-	// opener, exactly as the ungated pump delivered it.
-	if err := release(); err != nil {
-		publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, "stream_emit: "+err.Error())
-		return
-	}
-	// A mid-stream read failure means the client received a truncated stream:
-	// surface it as an error frame and record the attempt as failed.
-	if err := scanner.Err(); err != nil {
-		publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, err.Error())
-		if authID != "" {
-			recordUpstreamFailure(authID, cooldownModel, 0, err.Error())
+		// Queue ticket: honour the ticket's interval (the request context
+		// cancels the wait when the client is gone), then re-issue.
+		wait := queueWaitFor(sig.retryAfter)
+		if !queueWaitFn(httpReq.Context(), wait) {
+			return
 		}
-		// Deliberately not gated: empty-stream and read failures stay in-band
-		// even when the gate is open. The headGateStatus table would turn a
-		// guessed 502 into a hard failure, and policy.go keeps this "unexpected
-		// EOF" wording status-less on purpose so CPA treats a dropped stream as
-		// transport lifecycle instead of cooling the credential.
-		streamErrorSink(streamID, fmt.Sprintf("upstream stream read error: %v", err))
-		return
-	}
-	// v0.8.18: the async pump finally gets the same empty-stream guard the
-	// synchronous collector has had since v0.8.17 — a 200 envelope stream
-	// with zero payload is an upstream failure, not a silent success. (The
-	// seenPayload tracking used to be dead code here.) Same lifecycle reasoning
-	// as above: no hand-off abort, the message stays in-band.
-	if !seenPayload {
-		errEmpty := emptyStreamError()
-		publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, errEmpty.Error())
-		if authID != "" {
-			recordUpstreamFailure(authID, cooldownModel, 0, errEmpty.Error())
+		waited += wait
+		next, err := rebuild()
+		if err != nil {
+			msg := fmt.Sprintf("queue rebuild: %v", err)
+			publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, 0, msg)
+			gate.release()
+			streamErrorSink(streamID, msg)
+			return
 		}
-		streamErrorSink(streamID, errEmpty.Error())
-		return
+		httpReq = next
+		attempt++
 	}
-	publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), false, 0, "")
-	invalidateAccountCredits(authID, authUID)
 }
 
 // collectUpstreamStreamQoder is the QoderWork-flavoured synchronous fallback
 // (no async stream id): drain the upstream nested SSE, unwrap the inner
 // OpenAI chunks, return them as a slice. The collector, when non-nil,
 // observes the unwrapped inner chunks for usage extraction.
+//
+// v0.8.64: honours the 10605 RESOURCE_LIMIT queue ticket the same way the
+// async pump does — wait retryAfterSeconds and re-issue (the loop below),
+// bounded by queueRetryAllowed. The synchronous path has no request context,
+// so the wait is unconditional; nothing was collected yet on a ticket round,
+// which makes the restart safe.
 func collectUpstreamStreamQoder(encodedBody string, sa *storedAuth, modelKey string, sseFramed bool, collector *sseUsageCollector) ([]pluginapi.ExecutorStreamChunk, int, error) {
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChatFor(sa), strings.NewReader(encodedBody))
-	if err != nil {
-		return nil, 0, err
-	}
-	if err := applyCosyHeaders(httpReq, sa, encodedBody, endpointChatFor(sa), modelKey, true); err != nil {
-		return nil, 0, fmt.Errorf("cosy: %w", err)
-	}
-	stream, statusCode, _, err := hostHTTPDoStream(httpReq)
-	if err != nil {
-		return nil, 0, fmt.Errorf("http_error: %w", err)
-	}
-	defer stream.Close()
-	if statusCode >= 400 {
-		payload, _ := io.ReadAll(newHostStreamReader(stream))
-		// 0.8.13: account-level statuses ride the error envelope so the host
-		// cooldown layer stops re-picking a drained credential.
-		return nil, statusCode, upstreamStatusError(statusCode, chatUpstreamError(statusCode, string(payload)))
-	}
-	chunks := make([]pluginapi.ExecutorStreamChunk, 0, 64)
-	scanner := bufio.NewScanner(newHostStreamReader(stream))
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	seenPayload := false
-	for scanner.Scan() {
-		bodyStr, meaningful, frameErr := qoderUnwrapFrame(scanner.Text())
-		if frameErr != nil {
-			return chunks, 0, frameErr
+	var waited time.Duration
+	attempt := 0
+	for {
+		httpReq, err := http.NewRequest(http.MethodPost, endpointChatFor(sa), strings.NewReader(encodedBody))
+		if err != nil {
+			return nil, 0, err
 		}
-		seenPayload = seenPayload || meaningful
-		if bodyStr == "" || bodyStr == "[DONE]" {
-			continue
+		if err := applyCosyHeaders(httpReq, sa, encodedBody, endpointChatFor(sa), modelKey, true); err != nil {
+			return nil, 0, fmt.Errorf("cosy: %w", err)
 		}
-		if collector != nil {
-			collector.feed(bodyStr)
+		stream, statusCode, _, err := hostHTTPDoStream(httpReq)
+		if err != nil {
+			return nil, 0, fmt.Errorf("http_error: %w", err)
 		}
-		cleaned := cleanChunkJSON(bodyStr)
-		if cleaned == "" {
-			continue
+		if statusCode >= 400 {
+			payload, _ := io.ReadAll(newHostStreamReader(stream))
+			stream.Close()
+			sig := parseQueueSignal(string(payload))
+			if sig.detected && queueRetryAllowed(attempt, waited, sig.retryAfter) {
+				queueWaitFn(nil, queueWaitFor(sig.retryAfter))
+				waited += queueWaitFor(sig.retryAfter)
+				attempt++
+				continue
+			}
+			// 0.8.13: account-level statuses ride the error envelope so the host
+			// cooldown layer stops re-picking a drained credential.
+			errOut := chatUpstreamError(statusCode, string(payload))
+			if sig.detected && attempt > 0 {
+				errOut = fmt.Errorf("%w（已自动重试%d次共%.0fs仍排队）", errOut, attempt, waited.Seconds())
+			}
+			return nil, statusCode, upstreamStatusError(statusCode, errOut)
 		}
-		if sseFramed {
-			cleaned = "data: " + cleaned
+		chunks := make([]pluginapi.ExecutorStreamChunk, 0, 64)
+		scanner := bufio.NewScanner(newHostStreamReader(stream))
+		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		seenPayload := false
+		var frameTerminal error
+		for scanner.Scan() {
+			bodyStr, meaningful, frameErr := qoderUnwrapFrame(scanner.Text())
+			if frameErr != nil {
+				frameTerminal = frameErr
+				break
+			}
+			seenPayload = seenPayload || meaningful
+			if bodyStr == "" || bodyStr == "[DONE]" {
+				continue
+			}
+			if collector != nil {
+				collector.feed(bodyStr)
+			}
+			cleaned := cleanChunkJSON(bodyStr)
+			if cleaned == "" {
+				continue
+			}
+			if sseFramed {
+				cleaned = "data: " + cleaned
+			}
+			chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: json.RawMessage(cleaned)})
 		}
-		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: json.RawMessage(cleaned)})
+		stream.Close()
+		if frameTerminal != nil {
+			var fe *qoderFrameError
+			if errors.As(frameTerminal, &fe) && fe.queued != nil && queueRetryAllowed(attempt, waited, fe.queued.retryAfter) {
+				queueWaitFn(nil, queueWaitFor(fe.queued.retryAfter))
+				waited += queueWaitFor(fe.queued.retryAfter)
+				attempt++
+				continue
+			}
+			if attempt > 0 {
+				var fe *qoderFrameError
+				if errors.As(frameTerminal, &fe) && fe.queued != nil {
+					return chunks, 0, fmt.Errorf("%w（已自动重试%d次共%.0fs仍排队）", frameTerminal, attempt, waited.Seconds())
+				}
+			}
+			return chunks, 0, frameTerminal
+		}
+		if err := scanner.Err(); err != nil {
+			return chunks, 0, upstreamReadError(err)
+		}
+		// v0.8.17 empty-stream guard: a 200 envelope stream with zero payload
+		// chunks is an upstream failure, not a silent success.
+		if !seenPayload {
+			return chunks, 0, emptyStreamError()
+		}
+		return chunks, 0, nil
 	}
-	if err := scanner.Err(); err != nil {
-		return chunks, 0, upstreamReadError(err)
-	}
-	// v0.8.17 empty-stream guard: a 200 envelope stream with zero payload
-	// chunks is an upstream failure, not a silent success.
-	if !seenPayload {
-		return chunks, 0, emptyStreamError()
-	}
-	return chunks, 0, nil
 }
 
 // clientNeedsSSEFrame reports whether chunk payloads must carry their own
@@ -889,10 +1009,23 @@ func qoderUnwrapFrame(line string) (string, bool, error) {
 	}
 	_ = json.Unmarshal([]byte(body), &chunk)
 	if outer.Status >= 400 || (len(chunk.Error) > 0 && string(chunk.Error) != "null") {
-		return "", false, &qoderFrameError{
+		frameErr := &qoderFrameError{
 			msg:    fmt.Sprintf("qoder upstream error: %s", describeQoderEnvelopeRejection(body, chunk.Error, outer.Status)),
 			status: outer.Status,
 		}
+		// v0.8.64: recognise the 10605 queue ticket so the chat paths can wait
+		// and retry instead of failing (see queue_retry.go). The payload
+		// priority mirrors describeQoderEnvelopeRejection: the error field,
+		// when present, carries the envelope.
+		queuePayload := body
+		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
+			queuePayload = string(chunk.Error)
+		}
+		if sig := parseQueueSignal(queuePayload); sig.detected {
+			sig.status = outer.Status
+			frameErr.queued = &sig
+		}
+		return "", false, frameErr
 	}
 	// v0.8.25 (issue #19): the gateway also emits bare metadata objects on
 	// the data channel — observed right before [DONE]:
@@ -931,6 +1064,14 @@ func describeQoderEnvelopeRejection(body string, rawError json.RawMessage, statu
 	payload := body
 	if len(rawError) > 0 && string(rawError) != "null" {
 		payload = string(rawError)
+	}
+	// v0.8.64: the 10605 RESOURCE_LIMIT queue ticket rides nested JSON-string
+	// layers (code 403 -> message("10605...") -> retryAfterSeconds), so it is
+	// invisible to the flat probe below. Render it as one actionable line and
+	// stamp the queue_limit marker the cooldown classifier keys on.
+	if sig := parseQueueSignal(payload); sig.detected {
+		sig.status = status
+		return truncateRedacted(queueLimitLine(sig), 700)
 	}
 	var probe struct {
 		Code    any             `json:"code"`

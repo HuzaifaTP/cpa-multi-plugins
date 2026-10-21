@@ -354,7 +354,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.8.63"
+var version = "0.8.64"
 
 // providerName is a VAR (split flavor, issue #29): the unified build keeps
 // the default "qoder"; the split-channel builds rename it via
@@ -779,41 +779,79 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("body build: %w", err)
 	}
 	encodedBody := qoderEncode(body)
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChatFor(sa), strings.NewReader(encodedBody))
-	if err != nil {
-		return nil, err
+	// v0.8.64: honour the 10605 RESOURCE_LIMIT queue ticket — wait
+	// retryAfterSeconds and re-issue the request, bounded by
+	// queueRetryAllowed (see queue_retry.go). The ticket can arrive as the
+	// HTTP status or inside the SSE envelope as its first frame; both are
+	// recognised before anything is returned to the host, so the retry is
+	// invisible to the caller.
+	var queueWaited time.Duration
+	for attempt := 0; ; attempt++ {
+		httpReq, err := http.NewRequest(http.MethodPost, endpointChatFor(sa), strings.NewReader(encodedBody))
+		if err != nil {
+			return nil, err
+		}
+		if err := applyCosyHeaders(httpReq, sa, encodedBody, endpointChatFor(sa), upstreamModel, true); err != nil {
+			publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, "cosy: "+err.Error())
+			return nil, fmt.Errorf("cosy: %w", err)
+		}
+		// Compliance: route via host.http.do_stream so request-log captures the
+		// outbound call. Read entire body via the bridge, then fold SSE → completion.
+		stream, statusCode, _, err := hostHTTPDoStream(httpReq)
+		if err != nil {
+			publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
+			return nil, fmt.Errorf("http_error: %w", err)
+		}
+		if statusCode >= 400 {
+			payload, _ := io.ReadAll(newHostStreamReader(stream))
+			stream.Close()
+			sig := parseQueueSignal(string(payload))
+			if sig.detected && queueRetryAllowed(attempt, queueWaited, sig.retryAfter) {
+				queueWaitFn(nil, queueWaitFor(sig.retryAfter))
+				queueWaited += queueWaitFor(sig.retryAfter)
+				continue
+			}
+			publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(payload))
+			errOut := chatUpstreamError(statusCode, string(payload))
+			if sig.detected {
+				// The rendered queue line (not the raw envelope) feeds the
+				// classifiers — it carries the queue_limit marker
+				// recordUpstreamFailure keys on, plus the retry history.
+				if attempt > 0 {
+					errOut = fmt.Errorf("%w（已自动重试%d次共%.0fs仍排队）", errOut, attempt, queueWaited.Seconds())
+				}
+				recordUpstreamFailure(req.AuthID, cooldownModel, statusCode, errOut.Error())
+			} else {
+				recordUpstreamFailure(req.AuthID, cooldownModel, statusCode, string(payload))
+			}
+			reconcileAfterExecutorError(req.AuthID, statusCode, string(payload))
+			// 0.8.13: account-level statuses ride the error envelope so the host
+			// cooldown layer stops re-picking a drained credential.
+			return nil, upstreamStatusError(statusCode, errOut)
+		}
+		completion, err := aggregateQoderSSE(newHostStreamReader(stream), req.Model)
+		stream.Close()
+		if err != nil {
+			var fe *qoderFrameError
+			if errors.As(err, &fe) && fe.queued != nil && queueRetryAllowed(attempt, queueWaited, fe.queued.retryAfter) {
+				queueWaitFn(nil, queueWaitFor(fe.queued.retryAfter))
+				queueWaited += queueWaitFor(fe.queued.retryAfter)
+				continue
+			}
+			if attempt > 0 {
+				var fe *qoderFrameError
+				if errors.As(err, &fe) && fe.queued != nil {
+					err = fmt.Errorf("%w（已自动重试%d次共%.0fs仍排队）", err, attempt, queueWaited.Seconds())
+				}
+			}
+			publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
+			recordUpstreamFailure(req.AuthID, cooldownModel, 0, err.Error())
+			return nil, err
+		}
+		publishUsage(req.Model, upstreamModel, authUID, started, usageDetailFromCompletion(completion), false, 0, "")
+		invalidateAccountCredits(req.AuthID, authUID)
+		return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
 	}
-	if err := applyCosyHeaders(httpReq, sa, encodedBody, endpointChatFor(sa), upstreamModel, true); err != nil {
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, "cosy: "+err.Error())
-		return nil, fmt.Errorf("cosy: %w", err)
-	}
-	// Compliance: route via host.http.do_stream so request-log captures the
-	// outbound call. Read entire body via the bridge, then fold SSE → completion.
-	stream, statusCode, _, err := hostHTTPDoStream(httpReq)
-	if err != nil {
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
-		return nil, fmt.Errorf("http_error: %w", err)
-	}
-	defer stream.Close()
-	reader := newHostStreamReader(stream)
-	if statusCode >= 400 {
-		payload, _ := io.ReadAll(reader)
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(payload))
-		recordUpstreamFailure(req.AuthID, cooldownModel, statusCode, string(payload))
-		reconcileAfterExecutorError(req.AuthID, statusCode, string(payload))
-		// 0.8.13: account-level statuses ride the error envelope so the host
-		// cooldown layer stops re-picking a drained credential.
-		return nil, upstreamStatusError(statusCode, chatUpstreamError(statusCode, string(payload)))
-	}
-	completion, err := aggregateQoderSSE(reader, req.Model)
-	if err != nil {
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
-		recordUpstreamFailure(req.AuthID, cooldownModel, 0, err.Error())
-		return nil, err
-	}
-	publishUsage(req.Model, upstreamModel, authUID, started, usageDetailFromCompletion(completion), false, 0, "")
-	invalidateAccountCredits(req.AuthID, authUID)
-	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
 }
 
 // stripProviderPrefix removes the leading "qoder/" (or any "<provider>/")
@@ -890,6 +928,19 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	// client disconnects — otherwise the pump keeps reading a dead upstream until
 	// sharedHTTPClient's 120s timeout, holding a pool slot the whole time.
 	ctx, cancel := context.WithCancel(context.Background())
+	// v0.8.64: rebuildQueueRequest re-issues the upstream request for a 10605
+	// queue-ticket retry — the body reader is single-shot and the cosy signature
+	// is timestamped, so every round needs a freshly minted request.
+	rebuildQueueRequest := func() (*http.Request, error) {
+		retryReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointChatFor(sa), strings.NewReader(encodedBody))
+		if err != nil {
+			return nil, err
+		}
+		if err := applyCosyHeaders(retryReq, sa, encodedBody, endpointChatFor(sa), upstreamModel, true); err != nil {
+			return nil, err
+		}
+		return retryReq, nil
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointChatFor(sa), strings.NewReader(encodedBody))
 	if err != nil {
 		cancel()
@@ -911,7 +962,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	// hand-off: the pump owns the verdict channel and never blocks on us.
 	headTimeout := streamHeadTimeout()
 	gate := newStreamHeadGate(headTimeout)
-	go pumpUpstreamStream(httpReq, cancel, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID, cooldownModel, gate)
+	go pumpUpstreamStream(httpReq, rebuildQueueRequest, cancel, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID, cooldownModel, gate)
 	if verdict, decided := gate.awaitHandoff(headTimeout); decided && verdict.err != nil {
 		// Nothing was delivered, so the host can rotate/cool on a real status
 		// instead of accepting a successful-looking empty answer. The status is

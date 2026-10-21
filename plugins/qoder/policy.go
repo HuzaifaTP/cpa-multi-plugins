@@ -248,6 +248,13 @@ func chatUpstreamError(status int, body string) error {
 	if line, ok := collapseGatewayTimeoutPage(status, body); ok {
 		return errors.New(line)
 	}
+	// v0.8.64: a 10605 RESOURCE_LIMIT queue ticket is a capacity signal, not
+	// account trouble — render the actionable queue line (with the
+	// queue_limit marker recordUpstreamFailure's classifier keys on) instead
+	// of the raw JSON soup.
+	if sig := parseQueueSignal(body); sig.detected {
+		return fmt.Errorf("upstream %d: %s", status, queueLimitLine(sig))
+	}
 	trimmed := truncateRedacted(body, 200)
 	if chatInputTooLarge(status, body) {
 		return fmt.Errorf("输入过大被上游拒绝（请求级问题，与账号无关）：请压缩上下文/清理会话后重试 — upstream %d: %s", status, trimmed)
