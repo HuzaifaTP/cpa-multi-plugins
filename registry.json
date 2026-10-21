@@ -24,7 +24,7 @@
       "name": "CodeBuddy",
       "description": "Tencent CodeBuddy / WorkBuddy unified provider for CPA (merged v0.9.0 + v0.11.0): one credit pool, three realms (copilot.tencent.com CN, workbuddy.ai Global, codebuddy.ai Intl), dual login platforms (CLI + CodeBuddy IDE), auto-adopts legacy codebuddy-cn / codebuddy-intl auth files, OpenAI-compatible chat, daily check-in, credit lifecycle, multi-account pool.",
       "author": "mmqz",
-      "version": "0.9.61",
+      "version": "0.9.62",
       "changelog": "The 11128 conversation-header wave goes realm-unconditional — Global (PR #43) plus Intl (issue #44) and CN (issue #45) all carry the desktop client's X-Conversation-* headers now, blank-only fill, caller-supplied ids preserved.",
       "repository": "https://github.com/mmqz/cpa-multi-plugins",
       "homepage": "https://github.com/mmqz/cpa-multi-plugins/tree/main/plugins/workbuddy",

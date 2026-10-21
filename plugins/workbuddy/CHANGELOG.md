@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.9.62
+
+### The CN 11128 content trigger: DeepSeek Harness intro rewrite + request-scoped failure (PR #46)
+
+v0.9.61 made the conversation-header fill realm-unconditional, yet CN
+(`copilot.tencent.com`) kept answering `11128 "Illegal API invocation
+from an unapproved channel"` — the wave had a second, content-based
+trigger that headers cannot clear. PR #46 (ki11a-Conton) isolated it
+with a single-variable replay of a captured 175 KB failing request
+(47 messages, 66 tools, `reasoning_effort=max`): swapping only
+`messages[0].content` for `"You are a helpful assistant."` flipped
+400 → 200, and a binary search over the system prompt pinned the
+blocklisted string to the exact prefix
+`You are an AI agent powered by DeepSeek Harness` — the third member
+of the same template family as the Claude Code and Codex CLI intros
+`sanitizeBlockedTemplates` already rewrites. Every near-miss
+(`DeepSeek Harness` alone, `powered by DeepSeek Harness`,
+`…powered by DeepSeek.`, `…powered by Acme Harness.`) returns 200,
+so the gateway matches the verbatim prefix, and the rewrite replaces
+it with `You are an AI assistant` in system-role content only —
+user content is never touched, same as the existing rules.
+
+The second half of the PR fixes the blast radius, not the rejection:
+`upstreamStatusError` used to return 11128 as a bare error (status 0),
+so a v8 host read it as a generic upstream failure, rotated through
+every CN account, cooled all of them, and subsequent calls died with
+`503 auth_unavailable` although the credentials were fine. 11128 now
+carries `statusError{400}` across the RPC envelope; on CLIProxyAPI v8
+(`clienterror.IsRequestFault`) that classifies the failure as
+request-scoped — no rotation, no credential cooldown, the client sees
+the bilingual guidance immediately. On v7 hosts the change is inert
+(400 falls into MarkResult's default no-cooldown branch either way).
+
 ## 0.9.61
 
 ### The 11128 conversation-header wave goes realm-unconditional (issues #44, #45; extends PR #43)
