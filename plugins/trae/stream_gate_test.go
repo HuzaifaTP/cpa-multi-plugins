@@ -21,6 +21,12 @@ const soloAnswerSSE = "event: output\ndata: {\"response\":\"你好\"}\n\n" +
 	"event: done\ndata: {\"finish_reason\":\"stop\"}\n\n"
 
 // runHead 复刻 handleExecStream 的接线：回调先记录错误，转换器随后才吐出错误帧。
+// 排空尾巴：soloStreamHead 在首条答话帧即返回，而错误帧的 onErr 回调发生在
+// 其后的转换 goroutine 里——生产调用方会继续泵完整条流（错误帧照发、
+// NoteSuccess 被故障抑制），这里同样 range 到通道关闭，保证回调确定性完成。
+// 不排空时 faults.any() 与转换 goroutine 存在调度竞态：本地快机三连绿，
+// CI 慢 runner（2026-10-21 main 132709f）上首次答话帧后 goroutine 未及
+// 运行即断言，整套 test 门禁被一个 flake 卡红。
 func runHead(t *testing.T, sse string) ([][]byte, *upstream.SOLOStreamError, *soloFaultTracker) {
 	t.Helper()
 	faults := &soloFaultTracker{}
@@ -28,6 +34,10 @@ func runHead(t *testing.T, sse string) ([][]byte, *upstream.SOLOStreamError, *so
 		faults.record(se)
 	})
 	head, se := soloStreamHead(ch, faults)
+	for range ch {
+		// drain to close: the converter goroutine's error-frame callback
+		// must have fired before the assertions below run.
+	}
 	return head, se, faults
 }
 
