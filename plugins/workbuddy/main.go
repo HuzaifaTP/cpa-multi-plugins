@@ -614,6 +614,23 @@ func backendHeaders(req *http.Request, sa *storedAuth) {
 		req.Header.Set("X-IDE-Type", "WorkBuddy")
 		req.Header.Set("X-IDE-Version", "5.5.6")
 	}
+	// 2026-10-19 (issue #40 follow-up): the Global realm's gateway rejects
+	// otherwise-valid streaming chat calls with 11128 "request illegal"
+	// ("This call failed channel verification, possibly because it was not
+	// sent from an official client") unless the request carries the desktop
+	// client's three conversation-correlation headers. The token, body and
+	// every other header in the A/B runs were identical — adding these three
+	// turned 11128 into 200. CN and Intl realms do not check them, so this is
+	// scoped to Global to keep CN traffic byte-identical. Per-request random
+	// ids are accepted: the gateway validates presence/shape only.
+	if isGlobalDomain(sa.Auth.Domain) {
+		for _, h := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID"} {
+			if req.Header.Get(h) == "" {
+				req.Header.Set(h, growthClientToken())
+			}
+		}
+	}
+
 	if sa.Auth.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)
 	} else {
