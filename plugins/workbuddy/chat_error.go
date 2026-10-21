@@ -155,8 +155,15 @@ func (e *statusError) Unwrap() error   { return e.err }
 // cooldown — unchanged from pre-0.9.17 behavior).
 func upstreamStatusError(status int, payload string, err error) error {
 	switch {
+	// 11-128 is request-shaped (see isChannelRiskControl) yet used to be
+	// returned without a status code, so the host read it as a credential
+	// failure: it walked every account, cooled all of them, and the next
+	// calls died with "auth_unavailable" (503) although the credentials were
+	// fine. Attaching 400 makes the host classify it as request-scoped
+	// (clienterror.IsRequestFault) and stop after the first rejection.
+	case isChannelRiskControl(status, payload):
+		return &statusError{status: http.StatusBadRequest, err: err}
 	case isPromptTooLong(status, payload),
-		isChannelRiskControl(status, payload),
 		isModelNotRegistered(status, payload),
 		isModelScopedRateLimit(status, payload),
 		isWafBlocked(status, payload):

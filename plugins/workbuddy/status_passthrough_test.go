@@ -52,7 +52,9 @@ func TestUpstreamStatusErrorPolicy(t *testing.T) {
 		{"403 business envelope", 403, `{"code":11140,"msg":"request illegal"}`, 403},
 		{"413 prompt too long", 413, `<html>413</html>`, 0},
 		{"404 with 11115", 404, `{"code":11115,"msg":"prompt is too long"}`, 0},
-		{"400 channel risk 11128", 400, `{"code":11128,"msg":"channel risk"}`, 0},
+		// local patch: 11-128 keeps its request-scoped semantics but now carries
+		// the 400 so the host stops rotating and cooling accounts (see upstreamStatusError).
+		{"400 channel risk 11128", 400, `{"code":11128,"msg":"channel risk"}`, 400},
 		{"400 model not registered", 400, `{"code":11102,"msg":"model [x] service info not found"}`, 0},
 		{"403 waf no envelope", 403, `<html>challenge</html>`, 0},
 		{"400 plain business", 400, `{"code":11199,"msg":"bad request"}`, 0},

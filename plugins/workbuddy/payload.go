@@ -724,6 +724,18 @@ var (
 	// further description before the period.
 	reCodexCliIntro          = regexp.MustCompile(`(?i)you are a coding agent running in the codex cli[^.\n]*\.\s*codex cli is an open source project led by openai\s*\.?`)
 	codexCliIntroReplacement = "You are a helpful coding assistant running in the terminal."
+
+	// reDeepSeekHarnessIntro matches the DeepSeek Harness base-instructions
+	// opening signature, the third member of the same 11-128 family as the
+	// Claude Code and Codex CLI templates above. Single-variable replay
+	// against copilot.tencent.com: the bare sentence "You are an AI agent
+	// powered by DeepSeek Harness" returns 400 code 11-128 every time, while
+	// "DeepSeek Harness" alone, "powered by DeepSeek Harness", "You are an
+	// AI agent powered by DeepSeek." and the same sentence naming a different
+	// harness all return 200. Swapping only this sentence in a 175 KB
+	// request (47 messages, 66 tools, reasoning_effort=max) flips 400 -> 200.
+	reDeepSeekHarnessIntro          = regexp.MustCompile(`(?i)you are an ai agent powered by deepseek harness`)
+	deepSeekHarnessIntroReplacement = "You are an AI assistant"
 )
 
 func sanitizeBlockedTemplates(s string) string {
@@ -744,6 +756,10 @@ func sanitizeBlockedTemplates(s string) string {
 		"You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI.",
 		codexCliIntroReplacement)
 	s = reCodexCliIntro.ReplaceAllString(s, codexCliIntroReplacement)
+	// v0.9.62: DeepSeek Harness intro signature — same Tencent 11-128
+	// channel gate. System-role gating happens upstream in
+	// rewriteSystemMessagesInPlace — user content stays untouched.
+	s = reDeepSeekHarnessIntro.ReplaceAllString(s, deepSeekHarnessIntroReplacement)
 	return s
 }
 
