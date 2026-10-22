@@ -50,6 +50,18 @@ func prepareUpstreamBody(payload, original []byte, sa *storedAuth, upstreamModel
 	// 3. rewriteSystem: strip blocked Claude Code template phrases + force thinking.
 	rewriteSystemInPlace(obj)
 
+	// 3.2 sanitizeHistory: the same blocked phrases also arrive inside
+	// assistant history echoes and user pastes (agent hosts quote their own
+	// system prompt / config in conversation history). Tencent's 11-128
+	// channel gate scans the WHOLE body, not just system messages —
+	// 2026-10-21 replay evidence: a 50-message body with the phrases only in
+	// msg[4] (user) and msg[9] (assistant, 15x) 400s even with a clean
+	// system prompt; scrubbing every role to zero occurrences flips 400 →
+	// 200. Word-level rewrites keep meaning intact, so the v0.9.18
+	// system-only gate (which retired the wholesale neutralPrompt swap) is
+	// not in scope here.
+	sanitizeHistoryPhrasesInPlace(obj)
+
 	// 3.5 injectReasoning: fold historical assistant reasoning_content into
 	// content as <thought> blocks — the upstream drops the non-standard
 	// field from multi-turn history and the model loses its own prior
@@ -700,8 +712,10 @@ func ensureSystemMessage(payload []byte, sa *storedAuth) []byte {
 
 // (rewriteContentField / sanitizeContentText were removed in v0.9.18: they
 // applied the wholesale neutralPrompt replacement to messages of ANY role.
-// The system-scoped replacements live in rewriteSystemContentField above;
-// non-system messages are never rewritten — see rewriteSystemMessagesInPlace.)
+// Phrase-level rewrites are a different thing and are applied to every role
+// since v0.9.63: the system-scoped ones live in rewriteSystemContentField
+// above / rewriteSystemMessagesInPlace below, and the history-wide pass lives
+// in sanitizeHistoryPhrasesInPlace. Neither ever replaces a whole message.)
 
 // Blocked-template variants seen in the wild beyond the two verbatim
 // templates above: capitalization drift, straight/curly quote drift, and
@@ -736,6 +750,17 @@ var (
 	// request (47 messages, 66 tools, reasoning_effort=max) flips 400 -> 200.
 	reDeepSeekHarnessIntro          = regexp.MustCompile(`(?i)you are an ai agent powered by deepseek harness`)
 	deepSeekHarnessIntroReplacement = "You are an AI assistant"
+
+	// reDeepSeekHarnessWebGUI matches the fourth member of the same 11-128
+	// family as the intro signature above: the runtime-context line "the
+	// DeepSeek Harness Web GUI" that DSH injects into every session. Single-
+	// variable replay against copilot.tencent.com: the verbatim four-token
+	// phrase "DeepSeek Harness Web GUI" returns 400 code 11-128, while
+	// breaking any one token — "DeepSeek Harness Site GUI", "DeepSeek
+	// Harness Web UI", "Harness Web GUI", "Web GUI" alone — returns 200.
+	// Swap it for the verified-safe "web interface" phrasing.
+	reDeepSeekHarnessWebGUI          = regexp.MustCompile(`(?i)deepseek\s+harness\s+web\s+gui`)
+	deepSeekHarnessWebGUIReplacement = "DeepSeek Harness web interface"
 )
 
 func sanitizeBlockedTemplates(s string) string {
@@ -750,17 +775,118 @@ func sanitizeBlockedTemplates(s string) string {
 	// v0.9.54 (issue #31): Codex CLI intro signature — Tencent gateway
 	// channel risk-control (11128). Exact match first (the verified
 	// trigger), then the tolerant regex for case / phrasing drift between
-	// Codex releases. System-role gating happens upstream in
-	// rewriteSystemMessagesInPlace — user content stays untouched.
+	// Codex releases. Application scope is decided by the caller
+	// (rewriteSystemMessagesInPlace for system/developer, and
+	// sanitizeHistoryPhrasesInPlace for every other role since v0.9.63).
 	s = strings.ReplaceAll(s,
 		"You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI.",
 		codexCliIntroReplacement)
 	s = reCodexCliIntro.ReplaceAllString(s, codexCliIntroReplacement)
 	// v0.9.62: DeepSeek Harness intro signature — same Tencent 11-128
-	// channel gate. System-role gating happens upstream in
-	// rewriteSystemMessagesInPlace — user content stays untouched.
+	// channel gate. Same caller-decides scope as the Codex rule above.
 	s = reDeepSeekHarnessIntro.ReplaceAllString(s, deepSeekHarnessIntroReplacement)
+	// v0.9.62 follow-up: the DSH runtime-context line "the DeepSeek Harness
+	// Web GUI" is a separate member of the same Tencent 11-128 phrase family
+	// (verified by replay: only the full four-token phrase triggers).
+	s = reDeepSeekHarnessWebGUI.ReplaceAllString(s, deepSeekHarnessWebGUIReplacement)
 	return s
+}
+
+// sanitizeHistoryPhrasesInPlace applies the blocked-phrase rewrites to EVERY
+// message in the history — assistant echoes, tool results and user pastes
+// included (v0.9.63). Evidence chain (2026-10-21, single-variable replays
+// against copilot.tencent.com): a 50-message body whose only "DeepSeek
+// Harness Web GUI" occurrences live in msg[4] (user, 1x) and msg[9]
+// (assistant history echo of a DSH runtime-context summary, 15x) 400s with
+// code 11128 even when the system prompt is fully sanitized; scrubbing the
+// phrase in every role flips the same body to 200. The second trigger found
+// the same way: the Claude Code git-injection line "Main branch (you will
+// usually use this for PRs)" hits verbatim inside an assistant history echo
+// (case-insensitive, every token load-bearing: MainX/branchX/PRx/
+// broken-bracket variants all pass). The Tencent channel gate scans the
+// whole request body, so the v0.9.18 system-only gate leaves these echoes
+// exposed.
+//
+// Scope guard: this is NOT the retired v0.9.18 wholesale swap. Every
+// rewrite is the same single-word/synonym substitution the system path has
+// used since v0.9.28 — meaning-preserving, replay-verified safe — and
+// content without a trigger phrase passes byte-identical.
+//
+// Role dispatch: none — every role goes through the same phrase set. Per-phrase
+// role scoping is not trustworthy here: replay shows the Claude Code intro
+// phrase passes untouched from an assistant message while the Web GUI phrase
+// 400s from the same message, so which phrase the gate reads in which role is
+// not modellable from outside. Phrase-level substitution is meaning-preserving
+// in every role, so the blanket pass is the cheap side of that bet.
+//
+// Handles: string content; array content (per text part); tool_calls
+// function.arguments (agents echo protocol text there). reasoning_content
+// mirrors are folded from the already-sanitized content by
+// injectReasoningInPlace (step 3.5), so they need no separate pass here.
+func sanitizeHistoryPhrasesInPlace(obj map[string]any) bool {
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return false
+	}
+	changed := false
+	scrub := sanitizeBlockedTemplates
+	for _, mi := range msgs {
+		m, ok := mi.(map[string]any)
+		if !ok {
+			continue
+		}
+		// reasoning_content / reasoning (assistant-only fields) are folded
+		// into content by injectReasoningInPlace AFTER this pass (step 3.5),
+		// so sanitize them here or the fold re-arms the phrases.
+		if role, _ := m["role"].(string); strings.EqualFold(strings.TrimSpace(role), "assistant") {
+			for _, key := range []string{"reasoning_content", "reasoning"} {
+				if rc, ok := m[key].(string); ok && rc != "" {
+					if r := scrub(rc); r != rc {
+						m[key] = r
+						changed = true
+					}
+				}
+			}
+		}
+		if c, ok := m["content"].(string); ok {
+			if r := scrub(c); r != c {
+				m["content"] = r
+				changed = true
+			}
+		} else if parts, ok := m["content"].([]any); ok {
+			for _, pi := range parts {
+				p, ok := pi.(map[string]any)
+				if !ok {
+					continue
+				}
+				if t, ok := p["text"].(string); ok {
+					if r := scrub(t); r != t {
+						p["text"] = r
+						changed = true
+					}
+				}
+			}
+		}
+		if tcs, ok := m["tool_calls"].([]any); ok {
+			for _, tci := range tcs {
+				tc, ok := tci.(map[string]any)
+				if !ok {
+					continue
+				}
+				fn, ok := tc["function"].(map[string]any)
+				if !ok || fn == nil {
+					continue
+				}
+				if a, ok := fn["arguments"].(string); ok {
+					if r := scrub(a); r != a {
+						fn["arguments"] = r
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	return changed
 }
 
 // forceMaxThinking pins reasoning_effort to "high" for hy3/hy4-family models

@@ -48,6 +48,38 @@ func TestSanitizeBlockedTemplatesDeepSeekHarness(t *testing.T) {
 	}
 }
 
+// The DSH runtime-context line "the DeepSeek Harness Web GUI" is a separate
+// member of the same 11-128 phrase family (verified by single-variable
+// replay: only the full four-token phrase triggers; any broken token —
+// "DeepSeek Harness Site GUI", "DeepSeek Harness Web UI", "Harness Web GUI",
+// bare "Web GUI" — returns 200). It must be rewritten to the verified-safe
+// "web interface" phrasing.
+func TestSanitizeBlockedTemplatesDeepSeekHarnessWebGUI(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "verbatim",
+			in:   "You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names.",
+			want: "You are interacting with the user through the DeepSeek Harness web interface whose URL the runtime context names.",
+		},
+		{
+			name: "case drift",
+			in:   "through the deepseek harness web gui.",
+			want: "through the DeepSeek Harness web interface.",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeBlockedTemplates(tc.in); got != tc.want {
+				t.Fatalf("sanitizeBlockedTemplates(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 // Near-misses must survive untouched: only the full "You are an AI agent
 // powered by DeepSeek Harness" prefix is blocklisted (verified by replay —
 // each of these returned 200 against the live gateway).
@@ -58,6 +90,12 @@ func TestSanitizeBlockedTemplatesKeepsNearMisses(t *testing.T) {
 		"You are an AI agent powered by DeepSeek.",
 		"You are an AI agent powered by Acme Harness.",
 		"AI agent powered by DeepSeek Harness.",
+		// Web-GUI near-misses: each verified 200 against the live gateway.
+		"DeepSeek Harness Site GUI",
+		"DeepSeek Harness Web UI",
+		"Harness Web GUI",
+		"Web GUI",
+		"DeepSeek Harness web interface",
 	}
 	for _, in := range untouched {
 		if got := sanitizeBlockedTemplates(in); got != in {
@@ -69,8 +107,9 @@ func TestSanitizeBlockedTemplatesKeepsNearMisses(t *testing.T) {
 // deepSeekHarnessBody rebuilds the captured-failure shape from PR #46's
 // single-variable replay at miniature scale: a CN-realm account, a system
 // message opening with the DeepSeek Harness signature followed by real
-// instruction bulk, a user turn that pastes the same sentence (must NOT be
-// rewritten — system-role gate), and the reasoning_effort=max marker.
+// instruction bulk, a user turn that pastes the same sentence, and the
+// reasoning_effort=max marker. Both copies of the sentence are rewritten as
+// of v0.9.63 (the gate reads the whole body, not just the system role).
 func deepSeekHarnessBody(t *testing.T) []byte {
 	t.Helper()
 	tools := make([]map[string]any, 0, 8)
@@ -111,7 +150,9 @@ func deepSeekHarnessBody(t *testing.T) []byte {
 // TestPrepareUpstreamBodyDeepSeekHarnessEndToEnd drives the full pipeline
 // the compiled plugin runs (prepareUpstreamBody) with a CN-realm credential,
 // proving the rewrite survives body preparation and lands in the outbound
-// JSON while the user-role copy of the same sentence stays verbatim.
+// JSON. The user-role copy is rewritten too: the 2026-10-21 field failure
+// pinned that the gate reads past the system message, and DSH itself injects
+// its runtime-context boilerplate into user turns.
 func TestPrepareUpstreamBodyDeepSeekHarnessEndToEnd(t *testing.T) {
 	sa := &storedAuth{Auth: storedTokens{Domain: "copilot.tencent.com"}}
 	out := prepareUpstreamBody(deepSeekHarnessBody(t), nil, sa, "")
@@ -133,8 +174,11 @@ func TestPrepareUpstreamBodyDeepSeekHarnessEndToEnd(t *testing.T) {
 	}
 	user, _ := msgs[1].(map[string]any)
 	uc, _ := user["content"].(string)
-	if !strings.Contains(uc, "You are an AI agent powered by DeepSeek Harness.") {
-		t.Errorf("user-role copy of the sentence must stay verbatim (system-only gate), got %q", uc)
+	if strings.Contains(uc, "You are an AI agent powered by DeepSeek Harness.") {
+		t.Errorf("user-role copy must be rewritten as of v0.9.63 (whole-body gate), got %q", uc)
+	}
+	if !strings.Contains(uc, "You are an AI assistant.") {
+		t.Errorf("user-role rewrite must keep the surrounding sentence, got %q", uc)
 	}
 	// The captured failure carried reasoning_effort=max; the pipeline mirrors
 	// it to reasoning_summary but must not strip the rewrite.
@@ -173,4 +217,127 @@ func TestUpstreamStatusError11128CarriesRequestScopedStatus(t *testing.T) {
 	if !strings.Contains(env.Error.Message, "11128") {
 		t.Fatalf("bilingual guidance must survive the envelope, got %q", env.Error.Message)
 	}
+}
+
+// TestSanitizeHistoryPhrasesAssistantEcho pins the 2026-10-21 field failure:
+// the triggers lived in an ASSISTANT history echo (a DSH runtime-context
+// summary quoting "DeepSeek Harness Web GUI" 15x) and a user paste, with a
+// clean system prompt — the system-only sanitizer left the body 400/11128.
+// sanitizeHistoryPhrasesInPlace must scrub every role.
+func TestSanitizeHistoryPhrasesAssistantEcho(t *testing.T) {
+	body := map[string]any{
+		"model":  "deepseek-chat",
+		"stream": false,
+		"messages": []any{
+			map[string]any{"role": "system", "content": "You are an AI assistant."},
+			map[string]any{"role": "user", "content": "context: interacting through the DeepSeek Harness Web GUI today."},
+			map[string]any{
+				"role":    "assistant",
+				"content": "summary of runtime context:\n- the DeepSeek Harness Web GUI URL\n- Main branch (you will usually use this for PRs)\nDone.",
+			},
+			map[string]any{
+				"role":    "user",
+				"content": "Continue.",
+			},
+		},
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	sa := &storedAuth{Auth: storedTokens{Domain: "copilot.tencent.com"}}
+	out := prepareUpstreamBody(raw, nil, sa, "")
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs, _ := got["messages"].([]any)
+	lower := strings.ToLower(outStr(t, out))
+	for _, bad := range []string{"deepseek harness web gui", "main branch (you will usually use this for prs)"} {
+		if strings.Contains(lower, bad) {
+			t.Errorf("outbound body must not carry trigger phrase %q\nbody=%s", bad, outStr(t, out))
+		}
+	}
+	user, _ := msgs[1].(map[string]any)
+	uc, _ := user["content"].(string)
+	if !strings.Contains(uc, "DeepSeek Harness web interface") {
+		t.Errorf("user paste must be rewritten to the safe phrasing, got %q", uc)
+	}
+	asst, _ := msgs[2].(map[string]any)
+	ac, _ := asst["content"].(string)
+	if !strings.Contains(ac, "Default branch (you will usually use this for PRs)") {
+		t.Errorf("assistant echo of the git line must be rewritten, got %q", ac)
+	}
+	if !strings.Contains(ac, "- the DeepSeek Harness web interface URL") {
+		t.Errorf("assistant echo must keep line structure, got %q", ac)
+	}
+	// Non-trigger content must stay byte-identical.
+	tail, _ := msgs[3].(map[string]any)
+	tc, _ := tail["content"].(string)
+	if tc != "Continue." {
+		t.Errorf("non-trigger user content must pass verbatim, got %q", tc)
+	}
+}
+
+// TestSanitizeHistoryPhrasesToolCallsAndReasoning covers the two other
+// carriers: tool_calls.function.arguments and assistant reasoning_content
+// (which injectReasoningInPlace folds into content AFTER the scrub — the
+// folded <thought> block must not re-arm the phrases).
+func TestSanitizeHistoryPhrasesToolCallsAndReasoning(t *testing.T) {
+	body := map[string]any{
+		"model":  "deepseek-chat",
+		"stream": false,
+		"messages": []any{
+			map[string]any{"role": "system", "content": "You are an AI assistant."},
+			map[string]any{
+				"role":    "assistant",
+				"content": "checking",
+				"tool_calls": []any{
+					map[string]any{
+						"id":   "call_1",
+						"type": "function",
+						"function": map[string]any{
+							"name":      "read_file",
+							"arguments": `{"path":"notes.md","note":"system said: DeepSeek Harness Web GUI"}`,
+						},
+					},
+				},
+				"reasoning_content": "recall the Main branch (you will usually use this for PRs) rule",
+			},
+			map[string]any{"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+		},
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	sa := &storedAuth{Auth: storedTokens{Domain: "copilot.tencent.com"}}
+	out := prepareUpstreamBody(raw, nil, sa, "")
+	lower := strings.ToLower(outStr(t, out))
+	for _, bad := range []string{"deepseek harness web gui", "main branch (you will usually use this for prs)"} {
+		if strings.Contains(lower, bad) {
+			t.Errorf("outbound body must not carry trigger phrase %q\nbody=%s", bad, outStr(t, out))
+		}
+	}
+	if !strings.Contains(lower, "default branch (you will usually use this for prs)") {
+		t.Errorf("folded reasoning must be scrubbed too, got %s", outStr(t, out))
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs, _ := got["messages"].([]any)
+	asst, _ := msgs[1].(map[string]any)
+	tcs, _ := asst["tool_calls"].([]any)
+	tc0, _ := tcs[0].(map[string]any)
+	fn, _ := tc0["function"].(map[string]any)
+	args, _ := fn["arguments"].(string)
+	if !strings.Contains(args, "DeepSeek Harness web interface") {
+		t.Errorf("tool_calls arguments must be scrubbed, got %q", args)
+	}
+}
+
+func outStr(t *testing.T, b []byte) string {
+	t.Helper()
+	return string(b)
 }
