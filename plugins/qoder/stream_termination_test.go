@@ -83,3 +83,22 @@ func TestChunkCarriesFinish_LengthIsDeliberate(t *testing.T) {
 		t.Fatal("finish_reason=tool_calls must count as a deliberate end")
 	}
 }
+
+// The full-width DeepSeek delimiter must actually scrub (maintainer fixup for
+// #48: the as-merged regex put ｜tool_calls｜ before a \b that can never fire
+// after a non-ASCII character, leaving that alternative dead).
+func TestCleanChunkStripsFullWidthToolCallsDelimiter(t *testing.T) {
+	in := `{"choices":[{"delta":{"reasoning_content":"draft<｜tool_calls｜>junk</parameter> tail"}}]}`
+	out := cleanChunkJSON(in)
+	if strings.Contains(out, "｜tool_calls｜") || strings.Contains(out, "</parameter>") {
+		t.Fatalf("full-width delimiter survived: %s", out)
+	}
+	if !strings.Contains(out, "draft") || !strings.Contains(out, "tail") {
+		t.Fatalf("prose damaged: %s", out)
+	}
+	// ASCII word alternatives keep their boundary guard: <invoked> is a word,
+	// not a leaked tag.
+	if stripLeakedToolXML("keep <invoked> here") != "keep <invoked> here" {
+		t.Fatal("<invoked> must NOT be stripped (word-boundary guard)")
+	}
+}

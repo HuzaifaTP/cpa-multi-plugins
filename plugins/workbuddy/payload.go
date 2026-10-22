@@ -820,9 +820,10 @@ func sanitizeBlockedTemplates(s string) string {
 // in every role, so the blanket pass is the cheap side of that bet.
 //
 // Handles: string content; array content (per text part); tool_calls
-// function.arguments (agents echo protocol text there). reasoning_content
-// mirrors are folded from the already-sanitized content by
-// injectReasoningInPlace (step 3.5), so they need no separate pass here.
+// function.arguments (agents echo protocol text there). Assistant
+// reasoning_content / reasoning mirrors are scrubbed HERE, before the
+// injectReasoningInPlace fold (step 3.5) folds them into content — otherwise
+// the fold would re-arm the phrases in already-sanitized content.
 func sanitizeHistoryPhrasesInPlace(obj map[string]any) bool {
 	msgs, ok := obj["messages"].([]any)
 	if !ok || len(msgs) == 0 {

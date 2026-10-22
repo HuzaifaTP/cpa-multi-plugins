@@ -807,8 +807,13 @@ func cleanChunkJSON(s string) string {
 
 // leakedToolXMLTag matches the tag vocabulary a model uses when it *narrates* a
 // tool call as text instead of emitting a structured one. The full-width pipe
-// pair is the native DeepSeek delimiter; the rest is the XML dialect.
-var leakedToolXMLTag = regexp.MustCompile(`(?is)</?(?:｜tool_calls｜|tool_calls|function_calls|invoke|parameter)\b[^>]*>`)
+// pair is the native DeepSeek delimiter; the rest is the XML dialect. The
+// word-boundary guard applies ONLY to the ASCII word alternatives (so
+// <invoked> / <parameterization> stay untouched) — after a full-width pipe
+// there is never an ASCII word boundary, so that alternative must sit outside
+// the \b group (maintainer fixup 2026-10-22: as merged from #48 the
+// ｜tool_calls｜ branch could never match).
+var leakedToolXMLTag = regexp.MustCompile(`(?is)</?(?:｜tool_calls｜|(?:tool_calls|function_calls|invoke|parameter)\b)[^>]*>`)
 
 // stripLeakedToolXML removes those tags while keeping the surrounding text, so a
 // reasoning trace that drafted a call still reads as prose.
