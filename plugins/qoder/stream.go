@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -442,6 +443,13 @@ func pumpUpstreamStream(httpReq *http.Request, rebuild func() (*http.Request, er
 			scanner := bufio.NewScanner(newHostStreamReader(stream))
 			scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 			seenPayload := false
+			// sawFinish / sawTerminator witness a *deliberate* end of turn: a
+			// non-empty finish_reason on some choice, or the [DONE] sentinel. A
+			// stream that simply stops without either is a truncated answer, and
+			// forwarding it as a clean success is what turns an upstream cut into
+			// an agent that silently stops mid-turn.
+			sawFinish := false
+			sawTerminator := false
 			for scanner.Scan() {
 				bodyStr, meaningful, frameErr := qoderUnwrapFrame(scanner.Text())
 				if frameErr != nil {
@@ -476,8 +484,15 @@ func pumpUpstreamStream(httpReq *http.Request, rebuild func() (*http.Request, er
 					return queueSignal{}, false
 				}
 				seenPayload = seenPayload || meaningful
-				if bodyStr == "" || bodyStr == "[DONE]" {
+				if bodyStr == "" {
 					continue
+				}
+				if bodyStr == "[DONE]" {
+					sawTerminator = true
+					continue
+				}
+				if chunkCarriesFinish(bodyStr) {
+					sawFinish = true
 				}
 				collector.feed(bodyStr)
 				cleaned := cleanChunkJSON(bodyStr)
@@ -541,6 +556,18 @@ func pumpUpstreamStream(httpReq *http.Request, rebuild func() (*http.Request, er
 					recordUpstreamFailure(authID, cooldownModel, 0, errEmpty.Error())
 				}
 				streamErrorSink(streamID, errEmpty.Error())
+				return queueSignal{}, false
+			}
+			// A payload stream that stops without finish_reason/[DONE] delivered a
+			// partial answer. Report it in-band (same lifecycle as the empty-stream
+			// guard above) instead of letting the agent treat the truncation as the
+			// model's final word. Deliberately not recorded as an upstream failure:
+			// this classifier keys on the message text and the wording is status
+			// free, so the credential keeps its normal cooldown behaviour.
+			if !sawFinish && !sawTerminator {
+				msg := truncatedStreamError().Error()
+				publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, msg)
+				streamErrorSink(streamID, msg)
 				return queueSignal{}, false
 			}
 			publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), false, 0, "")
@@ -617,6 +644,10 @@ func collectUpstreamStreamQoder(encodedBody string, sa *storedAuth, modelKey str
 		scanner := bufio.NewScanner(newHostStreamReader(stream))
 		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 		seenPayload := false
+		// Same truncation witnesses as the streaming pump: an upstream that
+		// stops without finish_reason/[DONE] delivered a partial answer.
+		sawFinish := false
+		sawTerminator := false
 		var frameTerminal error
 		for scanner.Scan() {
 			bodyStr, meaningful, frameErr := qoderUnwrapFrame(scanner.Text())
@@ -625,8 +656,15 @@ func collectUpstreamStreamQoder(encodedBody string, sa *storedAuth, modelKey str
 				break
 			}
 			seenPayload = seenPayload || meaningful
-			if bodyStr == "" || bodyStr == "[DONE]" {
+			if bodyStr == "" {
 				continue
+			}
+			if bodyStr == "[DONE]" {
+				sawTerminator = true
+				continue
+			}
+			if chunkCarriesFinish(bodyStr) {
+				sawFinish = true
 			}
 			if collector != nil {
 				collector.feed(bodyStr)
@@ -664,6 +702,9 @@ func collectUpstreamStreamQoder(encodedBody string, sa *storedAuth, modelKey str
 		// chunks is an upstream failure, not a silent success.
 		if !seenPayload {
 			return chunks, 0, emptyStreamError()
+		}
+		if !sawFinish && !sawTerminator {
+			return chunks, 0, truncatedStreamError()
 		}
 		return chunks, 0, nil
 	}
@@ -725,6 +766,24 @@ func cleanChunkJSON(s string) string {
 					changed = true
 				}
 			}
+			// Some upstream models write the tool call as XML *text* instead of
+			// emitting real tool_calls. In the reasoning channel that is pure
+			// noise; in content it leaves stray tags behind (the classic tell is a
+			// lone "</invoke>" at the end of a turn).
+			if v, ok := delta["reasoning_content"].(string); ok {
+				if nv := stripLeakedToolXML(v); nv != v {
+					changed = true
+					if strings.TrimSpace(nv) == "" {
+						delete(delta, "reasoning_content")
+					} else {
+						delta["reasoning_content"] = nv
+					}
+				}
+			}
+			if v, ok := delta["content"].(string); ok && isLeakedToolXMLFragment(v) {
+				changed = true
+				delete(delta, "content")
+			}
 			// Drop a fully-empty delta ONLY when the choice carries no other
 			// signal (no finish_reason): e.g. {"delta":{"function_call":null}}
 			// reduced to {}. A delta with role/content:"" is meaningful and
@@ -744,6 +803,54 @@ func cleanChunkJSON(s string) string {
 		return s
 	}
 	return string(out)
+}
+
+// leakedToolXMLTag matches the tag vocabulary a model uses when it *narrates* a
+// tool call as text instead of emitting a structured one. The full-width pipe
+// pair is the native DeepSeek delimiter; the rest is the XML dialect.
+var leakedToolXMLTag = regexp.MustCompile(`(?is)</?(?:｜tool_calls｜|tool_calls|function_calls|invoke|parameter)\b[^>]*>`)
+
+// stripLeakedToolXML removes those tags while keeping the surrounding text, so a
+// reasoning trace that drafted a call still reads as prose.
+func stripLeakedToolXML(s string) string {
+	if !strings.Contains(s, "<") {
+		return s
+	}
+	return leakedToolXMLTag.ReplaceAllString(s, "")
+}
+
+// isLeakedToolXMLFragment reports whether s is nothing but tag remnants (plus
+// whitespace). Only then is blanking it safe: real prose, code or JSON that
+// merely mentions a tag keeps at least one non-tag character.
+func isLeakedToolXMLFragment(s string) bool {
+	t := strings.TrimSpace(s)
+	if t == "" || !strings.Contains(t, "<") {
+		return false
+	}
+	return strings.TrimSpace(stripLeakedToolXML(t)) == ""
+}
+
+// chunkCarriesFinish reports whether an SSE payload holds a non-empty
+// finish_reason on any choice — the only proof that the upstream finished the
+// turn on purpose.
+func chunkCarriesFinish(s string) bool {
+	if !strings.Contains(s, "finish_reason") {
+		return false
+	}
+	var obj struct {
+		Choices []struct {
+			FinishReason *string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal([]byte(s), &obj) != nil {
+		return false
+	}
+	for _, c := range obj.Choices {
+		if c.FinishReason != nil && *c.FinishReason != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
