@@ -139,7 +139,7 @@ const (
 // version is injected at build time via -ldflags "-X main.version=...".
 // Keep the default in sync with the release tag: the shipped build.sh does
 // NOT inject it (only "-s -w"), so the plugin reports this literal value.
-var version = "0.12.78"
+var version = "0.12.79"
 
 var (
 	hostAPI *C.cliproxy_host_api
@@ -950,13 +950,12 @@ func startLoginWithVariant(request []byte, lv string) ([]byte, error) {
 	}
 
 	// Step 5: Build verification URI with PKCE challenge.
-	// v0.12.76→v0.12.77: this identity is now only the install's
-	// BOOTSTRAP device — a synthetic identity for the authorization-page
-	// URL, built before anyone knows which account is logging in. The
-	// identity that gets REGISTERED server-side is derived PER ACCOUNT at
-	// the callback (applyDerivedIdentityCN/Intl, see device_identity.go)
-	// from the userInfo echo; the exchange points then carry it through
-	// the ctx/pending record.
+	// v0.12.79 (#47): this identity is THE identity of the whole login —
+	// the same device rides the authorization-page URL, the ExchangeToken
+	// DeviceInfo, the saved credential and every later bound refresh
+	// (magpie semantics: one device from sign-in through exchange;
+	// upstream ties the auth code to the URL's device, so nothing may
+	// swap the identity mid-flight — see device_identity.go).
 	ident := ensureLoginDeviceIdentity(host.AuthDir, lv)
 	deviceID, machineID := ident.DeviceID, ident.MachineID
 	verificationURI := buildVerificationURI(loginHost, verificationURIParams{
@@ -1220,18 +1219,18 @@ func handleCallbackConn(conn netConn, lc *loginCtx) bool {
 		}
 	}
 
-	// userInfo echo (v0.12.77 parity with the resource-callback route,
+	// userInfo echo (v0.12.25 parity with the resource-callback route,
 	// which has carried this since v0.12.25): the account's real
-	// UID/ScreenName. Besides the file-identity fallback, this is the
-	// trigger for the per-account DERIVED device identity — the local
-	// listener path used to miss it entirely, so listener logins never
-	// switched onto the account's own device.
+	// UID/ScreenName. Besides the file-identity fallback, this is where
+	// v0.12.77 used to swap the login onto the account's DERIVED device
+	// — v0.12.79 (#47) removed the swap (the exchange must keep the URL's
+	// sign-in device); the derived value is logged for diagnostics only.
 	if id := parseCallbackIdentity(vals); id.UID != "" {
 		lc.cbUID = id.UID
 		if id.Nickname != "" {
 			lc.cbNickname = id.Nickname
 		}
-		applyDerivedIdentityCN(lc, id.UID)
+		noteAccountDeviceIdentityCN(lc, id.UID)
 	}
 
 	// Refresh token (use directly — skip ExchangeToken auth-code path).

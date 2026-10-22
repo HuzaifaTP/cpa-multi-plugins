@@ -12,9 +12,9 @@
 // finding says the check-in CLAIM answers such tokens with 9074 (while
 // status queries stay code:0). This leg decides what to tell the user:
 //   - claim succeeds  → the credential is fully functional as-is;
-//   - claim 9074s     → the account needs ONE fresh login on v0.12.77+
-//     (which registers + binds the per-account derived
-//     device) for check-ins to work again.
+//   - claim 9074s     → the account needs ONE fresh login on v0.12.79+
+//     (which binds the installation's sign-in device with its key
+//     pair) for check-ins to work again.
 //
 // Run:
 //
@@ -50,7 +50,7 @@ func TestLiveCheckinClaim(t *testing.T) {
 	if err != nil {
 		t.Logf("check-in CLAIM refused: %v", err)
 		t.Logf("=> if this is 9074「当前参与用户太多」: the token is device-unbound (legacy renewal path).")
-		t.Logf("   Fix: ONE fresh panel login on trae v0.12.77+ binds the per-account derived device; bound renewals then claim fine.")
+		t.Logf("   Fix: ONE fresh panel login on trae v0.12.79+ binds the install's sign-in device; bound renewals then claim fine.")
 		return
 	}
 	t.Logf("check-in CLAIM OK: %+v", resp)

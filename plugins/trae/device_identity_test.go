@@ -165,47 +165,52 @@ func TestDerivedIdentityEmptyUID(t *testing.T) {
 	}
 }
 
-// TestApplyDerivedIdentitySwapsLoginCtx: the wiring the callback handlers
-// rely on — uid known → ctx ids AND key pair all swap together (a half-swap
-// would present one device's ids with another's keys).
-func TestApplyDerivedIdentitySwapsLoginCtx(t *testing.T) {
+// TestNoteAccountDeviceIdentityNeverSwapsCtx: v0.12.79 (#47) — the
+// callback "note" helpers must NEVER mutate the login ctx. v0.12.77/78
+// swapped ids AND key pair onto the derived identity here, which made the
+// ExchangeToken present a different device than the authorization URL —
+// every fresh login died 401 20403.
+func TestNoteAccountDeviceIdentityNeverSwapsCtx(t *testing.T) {
 	lc := &loginCtx{variant: "cn", deviceID: "bootstrap-dev", machineID: "bootstrap-mach",
 		devicePublicKey: "bootstrap-pub", devicePrivateKey: "bootstrap-priv"}
-	applyDerivedIdentityCN(lc, "1237380756941412")
-	id := deriveAccountDeviceIdentity("cn", "1237380756941412")
-	if lc.deviceID != id.DeviceID || lc.machineID != id.MachineID {
-		t.Fatalf("ctx ids not swapped: %s/%s", lc.deviceID, lc.machineID)
+	noteAccountDeviceIdentityCN(lc, "1237380756941412")
+	if lc.deviceID != "bootstrap-dev" || lc.machineID != "bootstrap-mach" {
+		t.Fatalf("cn ctx ids swapped: %s/%s — the 20403 regression is back", lc.deviceID, lc.machineID)
 	}
-	if lc.devicePublicKey != id.DevicePublicKey || lc.devicePrivateKey != id.DevicePrivateKey {
-		t.Fatal("ctx key pair not swapped")
+	if lc.devicePublicKey != "bootstrap-pub" || lc.devicePrivateKey != "bootstrap-priv" {
+		t.Fatal("cn ctx key pair swapped — the 20403 regression is back")
 	}
-	// Idempotent: a re-pasted callback derives the same identity again.
-	applyDerivedIdentityCN(lc, "1237380756941412")
-	if lc.deviceID != id.DeviceID {
-		t.Fatal("re-apply changed the identity — derivation must be idempotent")
+	// Re-pasted callback: still untouched (idempotent no-op).
+	noteAccountDeviceIdentityCN(lc, "1237380756941412")
+	if lc.deviceID != "bootstrap-dev" {
+		t.Fatal("re-noted ctx mutated")
 	}
-	// No uid → untouched (bootstrap identity stays).
-	applyDerivedIdentityCN(lc, "")
-	if lc.deviceID != id.DeviceID {
-		t.Fatal("empty uid must leave the ctx identity untouched")
+	// No uid → untouched.
+	noteAccountDeviceIdentityCN(lc, "")
+	if lc.deviceID != "bootstrap-dev" {
+		t.Fatal("empty uid mutated the ctx")
 	}
+	// nil ctx → no panic.
+	noteAccountDeviceIdentityCN(nil, "1237380756941412")
 }
 
-// TestApplyDerivedIdentityIntlCtx: the intl counterpart swap.
-func TestApplyDerivedIdentityIntlCtx(t *testing.T) {
-	lc := &intlloginCtx{deviceID: "bootstrap-dev", machineID: "bootstrap-mach"}
-	applyDerivedIdentityIntl(lc, "1b78b3c2-62f0-42e5-84fe-51e3c55e4914")
-	id := deriveAccountDeviceIdentity("intl", "1b78b3c2-62f0-42e5-84fe-51e3c55e4914")
-	if lc.deviceID != id.DeviceID || lc.machineID != id.MachineID {
-		t.Fatalf("intl ctx ids not swapped: %s/%s", lc.deviceID, lc.machineID)
+// TestNoteAccountDeviceIdentityIntlCtx: the intl counterpart never swaps.
+func TestNoteAccountDeviceIdentityIntlCtx(t *testing.T) {
+	lc := &intlloginCtx{deviceID: "bootstrap-dev", machineID: "bootstrap-mach",
+		devicePublicKey: "bootstrap-pub", devicePrivateKey: "bootstrap-priv"}
+	noteAccountDeviceIdentityIntl(lc, "1b78b3c2-62f0-42e5-84fe-51e3c55e4914")
+	if lc.deviceID != "bootstrap-dev" || lc.machineID != "bootstrap-mach" {
+		t.Fatalf("intl ctx ids swapped: %s/%s — the 20403 regression is back", lc.deviceID, lc.machineID)
 	}
-	if lc.devicePublicKey != id.DevicePublicKey || lc.devicePrivateKey != id.DevicePrivateKey {
-		t.Fatal("intl ctx key pair not swapped")
+	if lc.devicePublicKey != "bootstrap-pub" || lc.devicePrivateKey != "bootstrap-priv" {
+		t.Fatal("intl ctx key pair swapped — the 20403 regression is back")
 	}
+	noteAccountDeviceIdentityIntl(nil, "1b78b3c2-62f0-42e5-84fe-51e3c55e4914")
 }
 
-// TestEnsureIdentityMintAndReuse: the bootstrap identity file still mints
-// once and reuses (the authorization-page URL stays stable per install).
+// TestEnsureIdentityMintAndReuse: the sign-in identity file still mints
+// once and reuses (the login device is stable per install — re-logins
+// never mint a new device, the 20401 fix).
 func TestEnsureIdentityMintAndReuse(t *testing.T) {
 	dir := t.TempDir()
 	first := ensureLoginDeviceIdentity(dir, "cn")

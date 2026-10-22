@@ -12,9 +12,10 @@
 // the /cloudide fallback renews fine but keeps the chain on that record.
 // Device binding happens exactly ONCE, when the chain is created — i.e. at
 // the auth-code ExchangeToken of a fresh login (magpie's signedIn binds the
-// page-issued pair the same way). This is precisely why v0.12.77 derives the
-// per-account identity BEFORE the exchange: that is the one moment the
-// device can be chosen.
+// page-issued pair the same way). That is why the device can only be chosen
+// BEFORE the authorization URL exists; v0.12.77/v0.12.78 tried to swap it at
+// the callback (after the URL) and every fresh login died 401 20403 —
+// v0.12.79 (#47) keeps the URL's sign-in device through the exchange.
 //
 // What this leg does now (harmless, restores everything it touches):
 //

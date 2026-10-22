@@ -541,10 +541,10 @@ func intlhandleStartLogin(request []byte) ([]byte, error) {
 	}
 
 	// Step 5: Build verification URI with PKCE.
-	// v0.12.76→v0.12.77: bootstrap device only — the URI is built before
-	// the account is known; the identity registered server-side is
-	// derived PER ACCOUNT at the callback (applyDerivedIdentityIntl,
-	// device_identity.go). See the main.go counterpart.
+	// v0.12.79 (#47): this identity is THE identity of the whole login —
+	// URL, ExchangeToken DeviceInfo, saved credential and bound refresh
+	// all carry the same device (magpie semantics; see main.go
+	// counterpart and device_identity.go).
 	ident := ensureLoginDeviceIdentity(host.AuthDir, variantIntl)
 	deviceID, machineID := ident.DeviceID, ident.MachineID
 	verificationURI := intlbuildVerificationURI(loginHost, intlverificationURIParams{
@@ -1325,14 +1325,15 @@ func intlHandleCallbackConn(conn net.Conn, lc *intlloginCtx) bool {
 		}
 	}
 
-	// userInfo echo (v0.12.77 parity with the resource-callback route +
-	// per-account derived device identity, see handleCallbackConn).
+	// userInfo echo (v0.12.25 parity with the resource-callback route;
+	// v0.12.79 #47: log-only — the sign-in identity is never swapped,
+	// see handleCallbackConn).
 	if id := parseCallbackIdentity(vals); id.UID != "" {
 		lc.cbUID = id.UID
 		if id.Nickname != "" {
 			lc.cbNickname = id.Nickname
 		}
-		applyDerivedIdentityIntl(lc, id.UID)
+		noteAccountDeviceIdentityIntl(lc, id.UID)
 	}
 
 	// Auth code (multiple names; first non-empty wins).
