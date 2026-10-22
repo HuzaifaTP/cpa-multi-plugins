@@ -92,8 +92,10 @@ func TestCheckinWithWindowRetrySucceedsOnThirdCall(t *testing.T) {
 	}
 }
 
-// 持续 NOTHING_CLAIMABLE：初始 1 次 + 至多 3 次重试后定案，不再无限打。
-func TestCheckinWithWindowRetryCapsAtThreeRetries(t *testing.T) {
+// 持续 NOTHING_CLAIMABLE：初始 1 次 + 至多 windowRetryMaxAttempts 次重试后
+// 定案，不再无限打。v0.8.66：3 → 16（90s×16 ≈ 24 分钟，覆盖整个
+// [10:00,10:30) 滞后边距），配合同版本落地的 10:05 UTC+8 窗口锚定 tick。
+func TestCheckinWithWindowRetryCapsAtBoundedRetries(t *testing.T) {
 	calls := withWindowTestSeams(t, bjTime(10, 2), time.Millisecond, func(callNo int) (map[string]any, error) {
 		return map[string]any{"success": false, "result": "NOTHING_CLAIMABLE"}, nil
 	})
@@ -101,8 +103,8 @@ func TestCheckinWithWindowRetryCapsAtThreeRetries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("checkinWithWindowRetry: %v", err)
 	}
-	if *calls != 4 {
-		t.Fatalf("performCheckinCall called %d times, want 1 initial + 3 retries = 4", *calls)
+	if *calls != 1+windowRetryMaxAttempts {
+		t.Fatalf("performCheckinCall called %d times, want 1 initial + %d retries", *calls, windowRetryMaxAttempts)
 	}
 	if r, _ := res["result"].(string); r != "NOTHING_CLAIMABLE" {
 		t.Fatalf("final verdict = %v, want NOTHING_CLAIMABLE (definitive after retries)", res["result"])

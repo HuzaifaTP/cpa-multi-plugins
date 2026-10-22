@@ -354,7 +354,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.8.65"
+var version = "0.8.66"
 
 // providerName is a VAR (split flavor, issue #29): the unified build keeps
 // the default "qoder"; the split-channel builds rename it via
@@ -369,10 +369,10 @@ func wbRegistration() registration {
 			Name:             providerName,
 			Version:          version,
 			Author:           "Sliverkiss (based on qoderwork by lovingfish)",
-			GitHubRepository: "https://github.com/Sliverkiss/cpa-plugin",
+			GitHubRepository: "https://github.com/mmqz/cpa-multi-plugins",
 			Logo:             pluginLogoURL,
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "checkin_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable daily auto check-in at 09:00 and 21:00 local time for CN accounts (default true)."},
+				{Name: "checkin_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable daily auto check-in: window-anchored 10:05 UTC+8 (round-open timezone, works in any container TZ) plus 10:00/15:00/21:00 local compensation ticks (default true)."},
 				{Name: "login_region", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{regionCN, regionIntl}, Description: "Region for NEW logins: cn (qoder.cn, default) or intl (qoder.com). Existing accounts keep their own region; legacy qoder-cn-/qoder-intl- auth files are adopted automatically."},
 				{Name: "login_dialect", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{loginDialectCockpit, loginDialectDesktop}, Description: "DEPRECATED since v0.8.45 (no-op). Both CN and Intl now always use the official desktop-client v0.4.3 wire format (client_id 732aef47-… + machine identity + /users/sign-in?biz_variant=qoder wrapper) — the official first-login newbie grant (14-day Pro trial + 300 credits) fires server-side on every login. The config key is kept for backward compat only; both values produce the same URL."},
 				{Name: "claim_unverified", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Opt-in (default false): when true, the Pro-claim flow may claim a CLAIMABLE campaigns row whose reward face value could not be verified (unreadable or absent) instead of only reporting it. Rows that reveal a readable reward are never claimed here."},

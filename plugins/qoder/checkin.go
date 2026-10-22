@@ -1,7 +1,7 @@
 // checkin.go implements daily check-in for CN accounts: the manual
-// handleManualCheckin endpoint, the 09:00 / 21:00 auto scheduler, and the
-// per-account mutex that prevents duplicate check-ins from racing browser
-// tabs. CN accounts are excluded — they use one-shot trial claims instead.
+// handleManualCheckin endpoint, the auto scheduler (window-anchored 10:05
+// UTC+8 + local 10/15/21 ticks, see nextCheckinTime), and the per-account
+// mutex that prevents duplicate check-ins from racing browser tabs.
 //
 // v0.12.109 context (official Intl+CN desktop v0.4.3 asar forensics + field
 // report): the legacy daily UI no longer exists in the client — benefits ride
@@ -44,8 +44,42 @@ func ensureScheduler() {
 // during its own runtime teardown, where touching Go sync primitives from the
 // plugin's c-shared runtime caused SIGSEGV on every restart.
 
+// beijingZone is the round-open timezone: upstream daily rounds refresh at
+// 10:00 UTC+8 (live-verified, campaign.go dailyWindowJustOpened), independent
+// of the host container's local timezone.
+var beijingZone = time.FixedZone("UTC+8", 8*3600)
+
+// windowAnchorMinute is the minutes-past-10:00 (UTC+8) offset of the
+// window-anchored auto tick. 10:05 sits inside the documented visibility-lag
+// margin ([10:00, 10:30) — the row took ~4 minutes to appear on 2026-10-12)
+// so checkinWithWindowRetry's 90s retries can bridge the remaining lag.
+const windowAnchorMinute = 5
+
+// nextWindowAnchorTime returns the next 10:0<windowAnchorMinute> UTC+8 slot
+// at or after now, expressed in the same location as now (the timer only
+// needs the instant, not the zone).
+func nextWindowAnchorTime(now time.Time) time.Time {
+	bj := now.In(beijingZone)
+	t := time.Date(bj.Year(), bj.Month(), bj.Day(), 10, windowAnchorMinute, 0, 0, beijingZone)
+	if !t.After(now) {
+		t = t.Add(24 * time.Hour)
+	}
+	return t.In(now.Location())
+}
+
 func nextCheckinTime(now time.Time) time.Time {
 	var earliest time.Time
+	// v0.8.66 (Docker field report "再 docker 仍然不可签到"): the local-hour
+	// slots below fire at whatever wall-clock the CONTAINER thinks it is —
+	// Docker defaults to UTC, so "10:00" became 18:00 Beijing, 8 hours
+	// after the round opened and deep into the first-come-first-served
+	// stock window. The window anchor pins one tick to 10:05 UTC+8 (the
+	// round-open timezone itself) so every deployment — whatever TZ the
+	// container runs — attempts the claim minutes after the round opens.
+	earliest = nextWindowAnchorTime(now)
+	// Local slots stay as the compensation/evening cadence (10/15/21 in a
+	// correctly-TZ'd deployment; harmless extra status reads otherwise —
+	// every gate in front of the claim is idempotent).
 	// Consider both checkin and keepalive schedules so the timer wakes up for
 	// whichever fires first (e.g. 21:00 checkin vs 22:00 keepalive → 21:00 wins,
 	// then 22:00 keepalive fires on the next tick).
@@ -126,14 +160,20 @@ var performCheckinCallFn = performCheckinCall
 // var 供测试收缩。
 var windowRetryGap = 90 * time.Second
 
+// windowRetryMaxAttempts 边距内重试次数上限：90s × 16 ≈ 24 分钟，正好覆盖
+// [10:00, 10:30) 的整个可见性滞后边距（v0.8.66 前 3 次只到 ~10:10，10:12
+// 才出现的行要等 15:00/21:00 的本地兜底 tick）。
+const windowRetryMaxAttempts = 16
+
 // checkinWithWindowRetry 包装调度路径的签到调用：每日行在开窗后数分钟才对
 // 列表可见（2026-10-12 实弹，u673e7fcc：10:00:00 整点 tick 无行，10:04 领到
-// +100）。NOTHING_CLAIMABLE 且仍在滞后边距内时，重试至多 3 次再定案——
-// 把补领从 15:00 提前到 ~10:05。只用于调度路径；手动签到不阻塞（面板靠
-// campaignIdleDiagnosis 的窗口感知文案说明）。
+// +100）。NOTHING_CLAIMABLE 且仍在滞后边距内时，以 windowRetryGap 间隔重试
+// 直到边距耗尽（上限 windowRetryMaxAttempts 次）再定案——v0.8.66 的窗口锚定
+// tick（10:05 UTC+8）落地后，此循环就是「开窗即领」的主体。只用于调度路径；
+// 手动签到不阻塞（面板靠 campaignIdleDiagnosis 的窗口感知文案说明）。
 func checkinWithWindowRetry(sa *storedAuth) (map[string]any, error) {
 	res, err := performCheckinCallFn(sa)
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < windowRetryMaxAttempts; attempt++ {
 		if err != nil || res == nil {
 			return res, err
 		}

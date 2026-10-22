@@ -27,6 +27,16 @@
 // Escape hatches: QD_UMID_BIN (explicit binary) still wins over all of
 // this; QD_UMID_AUTO=0/false/no disables provisioning entirely. Failures
 // fall back to the derived identity and retry after a 6h cooldown.
+//
+// v0.8.66: QD_UMID_REGISTRY overrides the npm registry base (Docker field
+// report — CN deployments often cannot reach registry.npmjs.org directly,
+// which starved the identity bridge and left check-in on the derived
+// fallback). Point it at a trusted mirror, e.g.
+//
+//	QD_UMID_REGISTRY=https://registry.npmmirror.com
+//
+// The URL is the package document endpoint prefix: the plugin appends
+// /@qoder-ai/qodercli to it.
 package main
 
 import (
@@ -66,7 +76,7 @@ const (
 
 var (
 	// umidRegistryURL is a var so tests can point it at a stub server.
-	umidRegistryURL = umidRegistryURLDefault
+	umidRegistryURL = umidRegistryURLFromEnv()
 
 	// umidProvisionRunMu serializes provisioning attempts across regions/
 	// goroutines; umidProvisionStateMu guards the cached outcome below.
@@ -83,6 +93,20 @@ var (
 	// umidStateDirOverride is nil in production; tests point it at a t.TempDir.
 	umidStateDirOverride func() string
 )
+
+// umidRegistryURLFromEnv resolves QD_UMID_REGISTRY (v0.8.66): a registry base
+// whose package document path mirrors npm's — <base>/@qoder-ai/qodercli.
+// Trailing slashes are trimmed; an empty value keeps the official registry.
+func umidRegistryURLFromEnv() string {
+	v := strings.TrimRight(strings.TrimSpace(os.Getenv("QD_UMID_REGISTRY")), "/")
+	if v == "" {
+		return umidRegistryURLDefault
+	}
+	if !strings.HasPrefix(v, "http://") && !strings.HasPrefix(v, "https://") {
+		v = "https://" + v
+	}
+	return v
+}
 
 // umidProvisionEnabled reports whether auto-provisioning is on. Default on;
 // QD_UMID_AUTO=0/false/no turns it off (operators who ship their own binary

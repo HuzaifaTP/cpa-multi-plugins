@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.64
+
+### Store metadata: GitHubRepository points at the real repo
+
+The registration metadata declared `https://github.com/Sliverkiss/cpa-plugin`
+(the pre-fork upstream this plugin was originally adapted from) — every
+install has been telling the CPA host's plugin store the wrong source and
+update link since the first import. Now `mmqz/cpa-multi-plugins`, same as
+trae/zcode/mimo. qoder 0.8.66 carries the identical fix.
+
+(0.9.63 shipped without its own entry: PR #49's blocked-phrase scrub covers
+assistant echoes, user pastes, tool_calls arguments and reasoning mirrors —
+not only the system prompt — so the 11128 family cannot re-enter a
+conversation through any role.)
+
 ## 0.9.62
 
 ### The CN 11128 content trigger: DeepSeek Harness intro rewrite + request-scoped failure (PR #46)

@@ -4,6 +4,7 @@ package main
 
 import (
 	_ "embed"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -181,7 +182,7 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 		"active_auth":    activeID,
 		"checkin_auto":   auto,
 		"lifecycle_auto": lifecycleEnabled(),
-		"schedule":       []string{"09:00", "21:00"},
+		"schedule":       scheduleSummary(),
 		"server_time":    time.Now().Format("2006-01-02 15:04:05"),
 		"summary":        sum,
 	}
@@ -189,6 +190,18 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 		resp["lifecycle"] = life
 	}
 	return resp
+}
+
+// scheduleSummary renders the auto check-in cadence honestly (v0.8.66): the
+// window-anchored 10:05 UTC+8 tick (the round-open timezone itself — works in
+// any container TZ) plus the local-hour compensation ticks. The old hardcoded
+// ["09:00","21:00"] predated both the 10/15/21 rework and the window anchor.
+func scheduleSummary() []string {
+	out := []string{fmt.Sprintf("10:0%d (UTC+8 开窗锚定)", windowAnchorMinute)}
+	for _, h := range checkinHours {
+		out = append(out, fmt.Sprintf("%02d:00 (本地)", h))
+	}
+	return out
 }
 
 // summarizeCredits aggregates remain/used across dashboard accounts.

@@ -357,15 +357,19 @@ func displayNoteWithPrev(sa *storedAuth, cr *creditsSummary, disabled bool, prev
 	return note
 }
 
-// labelForAuth adds [CN] for host labels.
+// labelForAuth tags the host label with the account's real region.
+// v0.8.66: the tag was hardcoded "CN" (a leftover tautology `if "cn" == "global"`
+// from the pre-merge separate-plugin era) — every Intl account rendered as
+// "nickname [CN]" in the host's auth list, actively misleading region diagnosis
+// ("我的国际账号怎么显示 CN？签到是不是走错端点了？").
 func labelForAuth(sa *storedAuth) string {
 	base := "QoderWork"
 	if sa != nil && strings.TrimSpace(sa.Account.Nickname) != "" {
 		base = strings.TrimSpace(sa.Account.Nickname)
 	}
 	tag := "CN"
-	if "cn" == "global" {
-		tag = "CN"
+	if sa != nil && authRegion(sa) == regionIntl {
+		tag = "Intl"
 	}
 	return base + " [" + tag + "]"
 }
