@@ -1,0 +1,35 @@
+name: magpie-monitor
+
+# Daily 06:00 Asia/Shanghai == 22:00 UTC (GitHub schedules in UTC; runs can
+# be delayed a few minutes under load). workflow_dispatch allows instant
+# manual runs and cursor rewinds for deep digests.
+on:
+  schedule:
+    - cron: "0 22 * * *"
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Cursor override (ISO 8601 UTC), e.g. 2026-10-01T00:00:00Z — empty = continue from stored cursor"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: magpie-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run magpie ecosystem monitor
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAGPIE_MONITOR_REPO: mmqz/cpa-multi-plugins
+          MAGPIE_MONITOR_STATE: issue
+          MAGPIE_MONITOR_POST: "1"
+        run: python3 scripts/magpie_monitor.py --since "${{ inputs.since }}"

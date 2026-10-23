@@ -52,3 +52,6 @@ plugins/trae/tools/
 plugins/mimo/mimo
 plugins/mimo/mimo.so
 plugins/mimo/mimo.h
+
+# magpie monitor local-run state (CI keeps its state on the tracking issue)
+scripts/magpie_monitor_state.json
