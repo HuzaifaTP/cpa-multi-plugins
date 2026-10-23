@@ -83,3 +83,52 @@ func TestLiveBilling_DialStageEvidence(t *testing.T) {
 	}
 	t.Logf("net-diag: %s", suffix)
 }
+
+// TestLiveBilling_TransportReachesGateway proves the full production transport
+// ladder (billingCall → billingCallOnce → hostHTTPDo → direct pooled/rescue
+// transports → billingDialContext with the multi-source DNS + DoH) reaches the
+// application layer of BOTH billing gateways. It posts the real meter call
+// with a dummy token and asserts the failure (if any) is application-class —
+// a credential rejection or business code — and NEVER transport exhaustion
+// ("unreachable"): DNS, dial and TLS all worked. This is the credential-free
+// pre-release gate for the EOF/net-dial fixes.
+//
+// Run:
+//
+//	WB_LIVE_GATEWAY=1 go test -tags live -run TestLiveBilling_TransportReachesGateway -v ./plugins/workbuddy
+func TestLiveBilling_TransportReachesGateway(t *testing.T) {
+	if os.Getenv("WB_LIVE_GATEWAY") == "" {
+		t.Skip("WB_LIVE_GATEWAY not set — live gateway transport verification skipped")
+	}
+	cases := []struct {
+		name   string
+		domain string
+		base   string
+	}{
+		{"CN", "", "https://www.codebuddy.cn"},
+		{"Intl", "www.codebuddy.ai", "https://www.codebuddy.ai"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			region := "cn"
+			if tc.domain != "" {
+				region = "intl"
+			}
+			sa := &storedAuth{
+				Auth:    storedTokens{AccessToken: "live-transport-probe-dummy-token", Domain: tc.domain, Region: region, LoginPlatform: "ide"},
+				Account: storedAccount{UID: "live-transport-probe"},
+			}
+			body := map[string]any{"PageNumber": 1, "PageSize": 10, "ProductCode": "p_tcaca", "Status": []int{0, 3}}
+			_, err := billingCall(sa, "/v2/billing/meter/get-user-resource", body)
+			if err == nil {
+				t.Logf("%s: meter call unexpectedly succeeded with a dummy token (gateway auth bypass?) — transport proven anyway", tc.base)
+				return
+			}
+			t.Logf("%s: %v", tc.base, err)
+			if isTransientBillingErr(err) {
+				t.Fatalf("%s: transport-class failure — the ladder did NOT reach the gateway: %v", tc.base, err)
+			}
+			t.Logf("%s: application-layer answer received — transport ladder (DNS → DoH cross-check → dial → TLS → HTTP) verified end-to-end", tc.base)
+		})
+	}
+}

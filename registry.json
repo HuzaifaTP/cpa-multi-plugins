@@ -24,7 +24,7 @@
       "name": "CodeBuddy",
       "description": "Tencent CodeBuddy / WorkBuddy unified provider for CPA (merged v0.9.0 + v0.11.0): one credit pool, three realms (copilot.tencent.com CN, workbuddy.ai Global, codebuddy.ai Intl), dual login platforms (CLI + CodeBuddy IDE), auto-adopts legacy codebuddy-cn / codebuddy-intl auth files, OpenAI-compatible chat, daily check-in, credit lifecycle, multi-account pool.",
       "author": "mmqz",
-      "version": "0.9.64",
+      "version": "0.9.65",
       "changelog": "Store metadata fix: GitHubRepository now points at mmqz/cpa-multi-plugins (was the pre-fork Sliverkiss/cpa-plugin — wrong source/update link since the first import); plus the 0.9.63 note: 11128 blocked-phrase rewrites cover every role (#49).",
       "repository": "https://github.com/mmqz/cpa-multi-plugins",
       "homepage": "https://github.com/mmqz/cpa-multi-plugins/tree/main/plugins/workbuddy",

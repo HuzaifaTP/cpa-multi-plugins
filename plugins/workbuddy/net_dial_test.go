@@ -5,9 +5,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestBillingDialContext_IPLiteralFastPath pins the hermeticity contract: IP
@@ -229,3 +232,136 @@ func TestBriefNetErr(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// TestDialDoHEndpointsIncludeIPLiterals pins the v0.9.65 bootstrap fix: the DoH
+// endpoint list must carry IP-literal resolvers (no system-DNS dependency) so
+// a poisoned local resolver cannot take DoH down with it — the exact deadlock
+// of the 2026-10-23 field report (dns sys=<poisoned IPs> doh=none, every
+// candidate tcp=ok tls=EOF). At least three IP endpoints across three
+// providers, https, dns-json paths only.
+func TestDialDoHEndpointsIncludeIPLiterals(t *testing.T) {
+	ipLiteral := 0
+	for _, ep := range dialDoHEndpoints {
+		u, err := url.Parse(ep)
+		if err != nil {
+			t.Fatalf("endpoint %q unparseable: %v", ep, err)
+		}
+		if u.Scheme != "https" {
+			t.Fatalf("DoH endpoint %q must be https", ep)
+		}
+		if net.ParseIP(u.Hostname()) != nil {
+			ipLiteral++
+			if p := u.EscapedPath(); p != "/dns-query" && p != "/resolve" {
+				t.Fatalf("IP-literal DoH endpoint %q uses non-JSON path %q", ep, p)
+			}
+		}
+	}
+	if ipLiteral < 3 {
+		t.Fatalf("expected >= 3 IP-literal DoH endpoints (DNSPod/AliDNS/Cloudflare), got %d in %v", ipLiteral, dialDoHEndpoints)
+	}
+	hasHostnameFallback := false
+	for _, ep := range dialDoHEndpoints {
+		if strings.Contains(ep, "doh.pub") {
+			hasHostnameFallback = true
+		}
+	}
+	if !hasHostnameFallback {
+		t.Fatal("the hostname DoH fallback (doh.pub) was dropped from the endpoint list")
+	}
+}
+
+// TestQueryDoHGraceReturnsEarly pins the grace window: one healthy endpoint
+// plus one that hangs must not cost the full dohQueryTimeout — a poisoned
+// network leaves the hostname endpoints hanging, and the healthy IP answer
+// must not wait for them.
+func TestQueryDoHGraceReturnsEarly(t *testing.T) {
+	release := make(chan struct{})
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"Status":0,"Answer":[{"name":"grace-test.example","type":1,"TTL":60,"data":"9.9.9.9"}]}`))
+	}))
+	t.Cleanup(healthy.Close)
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	// Release the hung handler BEFORE hang.Close() — httptest's Close waits
+	// for outstanding requests, and the blocked handler owns one.
+	t.Cleanup(func() {
+		close(release)
+		hang.Close()
+	})
+
+	origEndpoints := dialDoHEndpoints
+	dialDoHEndpoints = []string{healthy.URL, hang.URL}
+	t.Cleanup(func() { dialDoHEndpoints = origEndpoints })
+
+	start := time.Now()
+	ips := queryDoH("grace-test.example")
+	elapsed := time.Since(start)
+	if len(ips) != 1 || !ips[0].Equal(net.ParseIP("9.9.9.9")) {
+		t.Fatalf("queryDoH = %v, want [9.9.9.9]", ips)
+	}
+	// With the grace window the return lands ~dohGraceWindow after the
+	// healthy answer (~1s); without it the hanging endpoint's 3s client
+	// timeout delays the return to ~3s. 2.2s cleanly separates the two.
+	if elapsed > dohGraceWindow+1200*time.Millisecond {
+		t.Fatalf("healthy DoH answer waited for the hanging endpoint: %v (grace window broken)", elapsed)
+	}
+}
+
+// TestDoHNegativeCache pins the fail-side cache: when every DoH endpoint is
+// dead the empty result is remembered for dohFailTTL so each dial in the
+// retry ladder doesn't re-pay the full probe budget.
+func TestDoHNegativeCache(t *testing.T) {
+	var hits int32
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(dead.Close)
+
+	origEndpoints := dialDoHEndpoints
+	dialDoHEndpoints = []string{dead.URL}
+	t.Cleanup(func() { dialDoHEndpoints = origEndpoints })
+
+	billingResetDialState() // clean fail-cache slate
+	t.Cleanup(billingResetDialState)
+
+	if ips := dohLookup("negcache-test.example"); len(ips) != 0 {
+		t.Fatalf("dead DoH must return empty, got %v", ips)
+	}
+	if ips := dohLookup("negcache-test.example"); len(ips) != 0 {
+		t.Fatalf("second lookup must hit the negative cache, got %v", ips)
+	}
+	if n := atomic.LoadInt32(&hits); n != 1 {
+		t.Fatalf("negative cache failed: %d endpoint probes for two lookups (want 1)", n)
+	}
+}
+
+// TestBillingDemoteGoodIP pins the demotion semantics: the cached-good IP is
+// dropped and dead-marked; unknown hosts, empty and unparseable bases are
+// quiet no-ops.
+func TestBillingDemoteGoodIP(t *testing.T) {
+	billingResetDialState()
+	t.Cleanup(billingResetDialState)
+
+	host := "demote-unit.test"
+	ip := net.ParseIP("203.0.113.77")
+	dialStateMarkGood(host, ip)
+
+	billingDemoteGoodIP("https://" + host + "/v2/billing/meter/get-user-resource")
+
+	dialStateMu.Lock()
+	_, hasGood := goodIPs[host]
+	_, hasDead := deadIPs[ip.String()]
+	dialStateMu.Unlock()
+	if hasGood {
+		t.Fatal("demote must drop the good-IP entry for the base's host")
+	}
+	if !hasDead {
+		t.Fatal("demote must dead-mark the demoted IP for deadIPTTL")
+	}
+
+	billingDemoteGoodIP("https://absent.test/v2") // no cached good IP — quiet no-op
+	billingDemoteGoodIP("://not-a-url")           // unparseable — quiet no-op
+	billingDemoteGoodIP("")                       // empty — quiet no-op
+}

@@ -195,9 +195,21 @@ func billingHeaders(req *http.Request, sa *storedAuth) {
 func billingCall(sa *storedAuth, path string, body any) (json.RawMessage, error) {
 	data, err := billingCallOnce(sa, path, body, 0)
 	attempts := 1
+	all5xx := is5xxBillingErr(err)
 	for _, d := range billingRetryDelays {
 		if err == nil || !isTransientBillingErr(err) {
 			break
+		}
+		// v0.9.65: a connection-level failure (EOF / reset / TLS-class) on the
+		// just-used dial path demotes the cached-good IP before the next
+		// attempt. Poisoned DNS answers and dead CDN edges accept TCP and kill
+		// the TLS flight — and without the demotion the dialer's own
+		// "winning"-IP stickiness re-dials the same broken edge on every
+		// remaining attempt, burning the whole ladder on one dead IP while
+		// healthy candidates sit unused right behind it (2026-10-23 field
+		// report: 4/4 attempts tls=EOF on the same sys-DNS IP).
+		if isConnLevelBillingErr(err) {
+			billingDemoteGoodIP(billingBaseFor(sa))
 		}
 		time.Sleep(d)
 		// Retry ladder (v0.9.52): attempt 1 and 3 run on the rescue transport
@@ -210,6 +222,7 @@ func billingCall(sa *storedAuth, path string, body any) (json.RawMessage, error)
 		// config and the plugin hasn't seen a HostConfigSummary yet.
 		data, err = billingCallOnce(sa, path, body, attempts)
 		attempts++
+		all5xx = all5xx && is5xxBillingErr(err)
 	}
 	if err != nil && isTransientBillingErr(err) {
 		// Transport-class exhaustion: keep the underlying error first (its
@@ -225,6 +238,15 @@ func billingCall(sa *storedAuth, path string, body any) (json.RawMessage, error)
 		// connections (a poisoned pooled conn would otherwise serve the
 		// next billing call straight from the pool).
 		billingResetDialState()
+		if all5xx {
+			// v0.9.65: every attempt got an HTTP answer back — the gateway is
+			// REACHABLE; it (or a service behind it) is failing. Reporting
+			// "unreachable" here sent a 2026-10-23 field report chasing local
+			// network/proxy causes while the net-diag in the very same line
+			// showed http=200 on direct probes: the failure was upstream
+			// (code 10000, the billing gateway's internal keycloak call).
+			return data, fmt.Errorf("%w — billing gateway answered HTTP 5xx on all %d attempts (upstream internal error: the gateway itself or a service behind it is failing — server-side, not a local network problem; the next scheduled check-in retries automatically)%s", err, attempts, billingNetDiagSuffix(billingBaseFor(sa)))
+		}
 		return data, fmt.Errorf("%w — billing gateway unreachable after %d attempts (direct pooled+rescue fresh-conn/v4 and host-bridge paths; set proxy-url in CPA config.yaml or HTTPS_PROXY on the host process if codebuddy.ai/workbuddy.ai needs a proxy from this network)%s", err, attempts, billingNetDiagSuffix(billingBaseFor(sa)))
 	}
 	return data, err
@@ -243,9 +265,18 @@ func isTransientBillingErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	if strings.HasPrefix(msg, "http 5") || strings.HasPrefix(msg, "http=5") || strings.Contains(msg, "status 5") {
+	if is5xxBillingErr(err) {
 		return true
+	}
+	// Application-layer answers first: the server SPOKE — a business code or a
+	// non-JSON body came back with a non-5xx status. These are never transport
+	// failures, even when the upstream's own error text embeds transport-shaped
+	// substrings (2026-10-23 field report: code 10000's msg contains
+	// `Get "http://keycloak-cluster-alias/...": EOF` — the server's INTERNAL
+	// call failed; our transport worked and must not be retried as if it
+	// hadn't).
+	if isAppLayerBillingErr(err) {
+		return false
 	}
 	transport := []string{
 		": EOF",                     // Go http client: server closed without a response
@@ -259,11 +290,81 @@ func isTransientBillingErr(err error) bool {
 		"connection refused",        // listener temporarily down
 	}
 	for _, pat := range transport {
+		if strings.Contains(msgOf(err), pat) {
+			return true
+		}
+	}
+	return false
+}
+
+// isAppLayerBillingErr reports whether err is an application-layer answer
+// (business code envelope, non-JSON body parse failure, or credential-level
+// gateway rejection) — shapes produced only after the transport succeeded.
+func isAppLayerBillingErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := msgOf(err)
+	return strings.HasPrefix(msg, "code=") ||
+		strings.HasPrefix(msg, "parse failed:") ||
+		strings.HasPrefix(msg, "credential rejected")
+}
+
+// is5xxBillingErr reports whether err is the upstream-5xx shape produced by
+// billingCallOnce ("http 500 from ...") or the growth HTTP error family —
+// the server ANSWERED, it just answered badly. Retryable, but fundamentally
+// different from a transport failure: the network path is fine.
+func is5xxBillingErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := msgOf(err)
+	return strings.HasPrefix(msg, "http 5") || strings.HasPrefix(msg, "http=5") || strings.Contains(msg, "status 5")
+}
+
+// isConnLevelBillingErr reports whether err means the connection itself died
+// (EOF / reset / TLS-class / IO-timeout) rather than the server answering
+// (5xx — reachable, server-side) or the resolver failing. The retry ladder
+// uses it to demote the cached-good dial IP: a TCP-good-but-TLS-dead edge
+// produces exactly these errors, and re-dialing it on every retry burns the
+// whole ladder on one broken candidate.
+func isConnLevelBillingErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if is5xxBillingErr(err) {
+		return false
+	}
+	// Application-layer answers (business code / parse failure / credential
+	// rejection) reached us over a working transport — never conn-level, even
+	// if the upstream's own error text embeds transport-shaped substrings.
+	if isAppLayerBillingErr(err) {
+		return false
+	}
+	msg := msgOf(err)
+	for _, pat := range []string{
+		": EOF",
+		"connection reset",
+		"broken pipe",
+		"TLS handshake timeout",
+		"tls:", // tls: handshake failure / cert verification / record-layer errors
+		"i/o timeout",
+		"Client.Timeout",
+		"context deadline exceeded",
+	} {
 		if strings.Contains(msg, pat) {
 			return true
 		}
 	}
 	return false
+}
+
+// msgOf renders err's message without a nil-pointer dance at every caller.
+func msgOf(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // billingCallOnce performs one billing HTTP attempt. attempt 0 uses the pooled

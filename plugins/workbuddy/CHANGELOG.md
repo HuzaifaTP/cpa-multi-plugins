@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.65
+
+### Billing transport survives poisoned DNS, and 5xx stops masquerading as "unreachable"
+
+Two Docker field reports (2026-10-23), two different failures, one root each.
+
+**Report 1 — `Post "https://www.codebuddy.cn/v2/billing/meter/get-user-resource": EOF`, net-diag `dns sys=4/42.202.170.203,42.100.48.83 doh=none`, every IP `tcp=ok tls=EOF`.**
+The DoH cross-check has existed since v0.9.53 precisely for this, but its endpoints were hostnames (`doh.pub`, `cloudflare-dns.com`) — resolved through the very system resolver that was handing out the poisoned 42.x answers. DoH died with the resolver (`doh=none`), the candidate list had nothing healthy left, and the dialer's good-IP stickiness then re-dialled the same TCP-good/TLS-dead edge on all four ladder attempts.
+
+- The DoH endpoint list now leads with IP-literal resolvers — DNSPod `120.53.53.53`, AliDNS `223.5.5.5`, Cloudflare `1.1.1.1` — all speaking the same dns-json dialect with IP-SAN certificates, needing no system-DNS bootstrap at all. The hostname forms stay behind them for name-proxied networks.
+- A connection-level failure (EOF / reset / TLS-class) now demotes the cached-good IP before the next attempt, so the ladder walks onto the next candidate instead of burning every retry on one dead edge (a hermetic two-IP replay reproduces the field exhaustion without the fix and recovers with it).
+- `queryDoH` now sends exactly one result message per endpoint — the old deferred-empty-send double-counted productive endpoints and let the collector finish before slow endpoints answered — and exits a grace window after the first productive answer instead of waiting for hanging endpoints. An all-dead DoH result is negatively cached for 15s.
+
+**Report 2 — `http 500 ... {"code":10000,"msg":"request failed: Get \"http://keycloak-cluster-alias/auth/realms/copilot/overseas/auth_code/access_token\"..."}` reported as "billing gateway unreachable".**
+The net-diag in the very same error line showed `tcp=ok tls=ok http=200` on direct probes — the gateway was reachable; its own internal keycloak call was failing. Exhaustion where every attempt got an HTTP answer is now reported as `answered HTTP 5xx on all N attempts (upstream internal error — server-side, not a local network problem; the next scheduled check-in retries automatically)` with the same net-diag attached. Application-layer answers (business-code envelopes such as `code=10000`, non-JSON parse failures, credential rejections) are never transport-classified again — even when the upstream's own error text embeds strings like `": EOF"`.
+
+Live verification (credential-free): `TestLiveBilling_TransportReachesGateway` posts the real meter call to www.codebuddy.cn and www.codebuddy.ai through the production ladder and asserts an application-layer answer — never transport exhaustion.
+
 ## 0.9.64
 
 ### Store metadata: GitHubRepository points at the real repo

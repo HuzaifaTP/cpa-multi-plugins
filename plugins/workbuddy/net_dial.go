@@ -40,8 +40,10 @@ import (
 
 const (
 	dialIPTimeout     = 4 * time.Second  // per-candidate TCP budget
-	dohQueryTimeout   = 3 * time.Second  // per-DoH-endpoint budget
+	dohQueryTimeout   = 3 * time.Second  // overall DoH budget
+	dohGraceWindow    = 1 * time.Second  // extra wait after the first productive DoH answer
 	dohCacheTTL       = 5 * time.Minute  // DoH answer cache
+	dohFailTTL        = 15 * time.Second // negative cache: window where a dead DoH result is not re-probed
 	goodIPTTL         = 10 * time.Minute // winning-IP stickiness
 	deadIPTTL         = 2 * time.Minute  // skip freshly-dead IPs
 	maxDialCandidates = 4                // candidates tried per dial call
@@ -71,8 +73,24 @@ var (
 		}
 		return ips, nil
 	}
-	dialDoHEndpoints = []string{"https://doh.pub/dns-query", "https://cloudflare-dns.com/dns-query"}
-	dialDoHClient    = &http.Client{Timeout: dohQueryTimeout}
+	dialDoHEndpoints = []string{
+		// v0.9.65 — IP-literal endpoints FIRST. The hostname forms below are
+		// resolved through the very system resolver this machinery exists to
+		// cross-check, so on a poisoned deployment both hostname endpoints die
+		// with the resolver and DoH reports "none" (field report 2026-10-23:
+		// `dns sys=4/42.202.170.203,42.100.48.83 doh=none`, every IP tcp=ok
+		// tls=EOF — total deadlock, the candidate list had no healthy IP left).
+		// The IP forms need no resolution at all: DNSPod (120.53.53.53), AliDNS
+		// (223.5.5.5) and Cloudflare (1.1.1.1) all speak the dns-json dialect
+		// and present IP-SAN certificates, so at least one survives broken
+		// local DNS. Hostname forms stay for name-proxied networks.
+		"https://120.53.53.53/dns-query",
+		"https://223.5.5.5/resolve",
+		"https://1.1.1.1/dns-query",
+		"https://doh.pub/dns-query",
+		"https://cloudflare-dns.com/dns-query",
+	}
+	dialDoHClient = &http.Client{Timeout: dohQueryTimeout}
 )
 
 // Dial-state caches. One mutex guards all of them — contention is irrelevant
@@ -83,6 +101,7 @@ var (
 	goodIPAt    = map[string]time.Time{} // host → when the win was recorded
 	deadIPs     = map[string]time.Time{} // "ip" → skip-until timestamp
 	dohCache    = map[string]dohEntry{}  // host → DoH answers
+	dohFailAt   = map[string]time.Time{} // host → when DoH last came back empty
 )
 
 type dohEntry struct {
@@ -285,89 +304,156 @@ func billingResetDialState() {
 	goodIPs = map[string]net.IP{}
 	goodIPAt = map[string]time.Time{}
 	deadIPs = map[string]time.Time{}
+	dohFailAt = map[string]time.Time{}
 	dialStateMu.Unlock()
 	sharedHTTPClient().CloseIdleConnections()
 	rescueHTTPClient().CloseIdleConnections()
+}
+
+// billingDemoteGoodIP drops the cached-good dial IP for a billing base's host
+// and dead-marks it for deadIPTTL. The retry ladder calls it after a
+// connection-level failure (EOF / reset / TLS-class): those errors mean the
+// TCP-good IP the dialer just picked is serving a dead session — poisoned DNS
+// answers and dead CDN edges accept TCP and then kill the TLS flight, exactly
+// the profile that kept the ladder's own "winning"-IP stickiness re-dialing
+// the broken edge on all four attempts (2026-10-23 field report). No-op when
+// no good IP is cached (first dial, or the failure came from a pooled conn).
+func billingDemoteGoodIP(base string) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return
+	}
+	host := u.Hostname()
+	if host == "" {
+		return
+	}
+	dialStateMu.Lock()
+	defer dialStateMu.Unlock()
+	ip, ok := goodIPs[host]
+	if !ok {
+		return
+	}
+	deadIPs[ip.String()] = time.Now().Add(deadIPTTL)
+	delete(goodIPs, host)
+	delete(goodIPAt, host)
 }
 
 // -----------------------------------------------------------------------------
 // DoH resolution
 // -----------------------------------------------------------------------------
 
-// dohLookup returns cached DoH answers for host, querying both endpoints
+// dohLookup returns cached DoH answers for host, querying the endpoints
 // concurrently on cache miss. Failures are non-fatal: an empty result simply
-// leaves the system-DNS candidates in charge.
+// leaves the system-DNS candidates in charge — and is negatively cached for
+// dohFailTTL so a deployment whose DoH paths are all dead doesn't pay the
+// full probe budget on every dial.
 func dohLookup(host string) []net.IP {
 	dialStateMu.Lock()
 	if e, ok := dohCache[host]; ok && time.Since(e.at) < dohCacheTTL {
 		dialStateMu.Unlock()
 		return e.ips
 	}
+	if f, ok := dohFailAt[host]; ok && time.Since(f) < dohFailTTL {
+		dialStateMu.Unlock()
+		return nil
+	}
 	dialStateMu.Unlock()
 
 	ips := queryDoH(host)
+	dialStateMu.Lock()
 	if len(ips) > 0 {
-		dialStateMu.Lock()
 		dohCache[host] = dohEntry{ips: ips, at: time.Now()}
-		dialStateMu.Unlock()
+		delete(dohFailAt, host)
+	} else {
+		dohFailAt[host] = time.Now()
 	}
+	dialStateMu.Unlock()
 	return ips
 }
 
 // queryDoH issues RFC 8484-style JSON queries (application/dns-json, the
-// Google/Cloudflare/doh.pub JSON dialect) to every endpoint concurrently and
-// merges the unique A records.
+// Google/Cloudflare/doh.pub JSON dialect) to every endpoint concurrently,
+// merging the unique A records. It returns as soon as every endpoint answered,
+// or dohGraceWindow after the first productive answer (a poisoned network can
+// leave the hostname endpoints hanging until their client timeout — the
+// healthy IP answers must not wait for them), or at the overall budget.
 func queryDoH(host string) []net.IP {
 	type result struct{ ips []net.IP }
 	ch := make(chan result, len(dialDoHEndpoints))
 	for _, ep := range dialDoHEndpoints {
 		go func(endpoint string) {
-			defer func() { ch <- result{} }() // default on any exit path
-			u := endpoint + "?name=" + url.QueryEscape(host) + "&type=A"
-			req, err := http.NewRequest(http.MethodGet, u, nil)
-			if err != nil {
-				return
-			}
-			req.Header.Set("accept", "application/dns-json")
-			resp, err := dialDoHClient.Do(req)
-			if err != nil {
-				return
-			}
-			defer resp.Body.Close()
-			var payload struct {
-				Answer []struct {
-					Type int    `json:"type"`
-					Data string `json:"data"`
-				} `json:"Answer"`
-			}
-			if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&payload); err != nil {
-				return
-			}
-			var ips []net.IP
-			for _, a := range payload.Answer {
-				if a.Type == 1 {
-					if ip := net.ParseIP(strings.TrimSpace(a.Data)); ip != nil {
-						ips = append(ips, ip)
-					}
-				}
-			}
-			if len(ips) > 0 {
-				ch <- result{ips: ips}
-			}
+			// Exactly one send per goroutine on every exit path — the old
+			// "defer empty send + productive send" double-counted productive
+			// endpoints and let the collector finish before slow endpoints
+			// answered.
+			ch <- result{ips: dohQueryEndpoint(endpoint, host)}
 		}(ep)
 	}
 	var out []net.IP
 	seen := map[string]bool{}
-	for range dialDoHEndpoints {
-		r := <-ch
-		for _, ip := range r.ips {
+	addNew := func(ips []net.IP) bool {
+		added := false
+		for _, ip := range ips {
 			if !seen[ip.String()] {
 				seen[ip.String()] = true
 				out = append(out, ip)
+				added = true
 			}
+		}
+		return added
+	}
+	deadline := time.After(dohQueryTimeout)
+	var grace <-chan time.Time
+	for answered := 0; answered < len(dialDoHEndpoints); {
+		select {
+		case r := <-ch:
+			answered++
+			if len(r.ips) > 0 && addNew(r.ips) && grace == nil {
+				// First productive answer: give the remaining endpoints a
+				// short window to widen the candidate set, then return.
+				grace = time.After(dohGraceWindow)
+			}
+		case <-grace:
+			return out
+		case <-deadline:
+			return out
 		}
 	}
 	return out
+}
+
+// dohQueryEndpoint queries one DoH endpoint (dns-json dialect) and returns its
+// A records; nil on any failure.
+func dohQueryEndpoint(endpoint, host string) []net.IP {
+	u := endpoint + "?name=" + url.QueryEscape(host) + "&type=A"
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("accept", "application/dns-json")
+	resp, err := dialDoHClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var payload struct {
+		Answer []struct {
+			Type int    `json:"type"`
+			Data string `json:"data"`
+		} `json:"Answer"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&payload); err != nil {
+		return nil
+	}
+	var ips []net.IP
+	for _, a := range payload.Answer {
+		if a.Type == 1 {
+			if ip := net.ParseIP(strings.TrimSpace(a.Data)); ip != nil {
+				ips = append(ips, ip)
+			}
+		}
+	}
+	return ips
 }
 
 // -----------------------------------------------------------------------------
