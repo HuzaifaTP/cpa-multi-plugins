@@ -55,3 +55,7 @@ plugins/mimo/mimo.h
 
 # magpie monitor local-run state (CI keeps its state on the tracking issue)
 scripts/magpie_monitor_state.json
+
+# python bytecode
+__pycache__/
+*.pyc
