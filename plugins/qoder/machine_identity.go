@@ -122,15 +122,32 @@ const machineIdentityTTL = 30 * time.Minute
 // takes ~3.7s in the hub capture; 25s leaves generous headroom.
 const runtimeInfoTimeout = 25 * time.Second
 
+// runtimeInfoEnvironment is the region's bridge dialect selector
+// (v0.8.67, magpie 0.2.30 forensics cross-verified empirically 2026-10-23):
+// Qoder CN's desktop 0.4.9 passes `regionCode === "global" ? 3 : 0` → 0,
+// and its CLI (qoderclicn 1.1.64+) uses UMID environment ONLINE = 0; the
+// international clients use 3 (US_ONLINE). The hub capture's `prod` also
+// works (live-verified v0.8.60 Intl) — the binary accepts all three and
+// emits the same P1gA/91/00 shape (sandbox-verified against the CN CLI
+// 1.1.77 bundle's bridge: args 0, 3 and prod all exit 0 with well-formed
+// identities) — but 0/3 are the clients' own values, so those we send.
+func runtimeInfoEnvironment(region string) string {
+	if normalizeRegion(region) == regionCN {
+		return "0"
+	}
+	return "3"
+}
+
 // runtimeInfoArgs returns the official spawn dialect for one GOOS (client
 // bundle, function IUt): win32/darwin get [env, --account-stdin] plus the
 // account JSON on stdin; linux gets [env] and stdin is ignored. The bool
 // reports whether stdin carries the account payload.
-func runtimeInfoArgs(goos string) ([]string, bool) {
+func runtimeInfoArgs(goos, region string) ([]string, bool) {
+	env := runtimeInfoEnvironment(region)
 	if goos == "windows" || goos == "darwin" {
-		return []string{"prod", "--account-stdin"}, true
+		return []string{env, "--account-stdin"}, true
 	}
-	return []string{"prod"}, false
+	return []string{env}, false
 }
 
 // identitySourceNative is the Source value the official bridge produces.
@@ -201,14 +218,27 @@ func machineIdentityFor(region, uid string, force bool) machineIdentity {
 // actually fixes container check-in — under a derived identity the daily
 // CLAIM_BENEFIT row was invisible and the claim itself 503'd; under the
 // provisioned official bridge the row appeared and the claim granted +100.
+//
+// v0.8.67: the whole ladder is REGION-SCOPED. The discovery paths (desktop
+// install dirs, CLI cache), the env overrides (QODERCN_RUNTIME_INFO vs
+// QODER_RUNTIME_INFO), the provisioned npm package (@qodercn-ai/qoderclicn
+// vs @qoder-ai/qodercli) and the bridge's environment argument (0 vs 3) all
+// key on the account's region now — CN reads Qoder CN's own helper and never
+// the international one's, exactly as both clients themselves do (magpie
+// 0.2.30, yetone/magpie#2911 + plugins#304: after Qoder CN moved the daily
+// 100 Credits into the desktop's 权益中心, a CN campaigns request without
+// Qoder CN's own identity stopped being offered the daily row). The two npm
+// packages embed a byte-identical bridge (linux-x64 sha256 e30b307e…, both
+// verified 2026-10-23), so the split is about presenting the identity the
+// region's clients would have presented — env arg and cache placement.
 func computeMachineIdentity(region, uid string) machineIdentity {
 	if exe := runtimeInfoExePath(region); exe != "" {
-		if id := nativeMachineIdentityFrom(exe, uid); id != nil {
+		if id := nativeMachineIdentityFrom(exe, uid, region); id != nil {
 			return *id
 		}
 	}
-	if exe := provisionedRuntimeInfo(); exe != "" {
-		if id := nativeMachineIdentityFrom(exe, uid); id != nil {
+	if exe := provisionedRuntimeInfo(region); exe != "" {
+		if id := nativeMachineIdentityFrom(exe, uid, region); id != nil {
 			return *id
 		}
 	}
@@ -218,8 +248,8 @@ func computeMachineIdentity(region, uid string) machineIdentity {
 // nativeMachineIdentityFrom runs the official bridge once and maps its JSON
 // onto machineIdentity. Returns nil when anything is missing — a partial
 // identity is worse than an honest derivation.
-func nativeMachineIdentityFrom(exe, uid string) *machineIdentity {
-	data := runRuntimeInfo(exe, uid)
+func nativeMachineIdentityFrom(exe, uid, region string) *machineIdentity {
+	data := runRuntimeInfo(exe, uid, region)
 	if data == nil {
 		return nil
 	}
@@ -376,14 +406,15 @@ func strField(m map[string]any, key string) string {
 	return s
 }
 
-// runRuntimeInfo spawns the official bridge with the client's per-platform
-// dialect (IUt): win32/darwin `runtime-info[.exe] prod --account-stdin` with
-// one JSON object on stdin, linux `runtime-info prod` with stdin closed —
-// first stdout line is the answer either way.
-func runRuntimeInfo(exe, uid string) map[string]any {
+// runRuntimeInfo spawns the official bridge with the client's per-platform,
+// per-region dialect (IUt + magpie 0.2.30): win32/darwin
+// `runtime-info[.exe] <env> --account-stdin` with one JSON object on stdin,
+// linux `runtime-info <env>` with stdin closed — first stdout line is the
+// answer either way. <env> is 0 for CN, 3 for international.
+func runRuntimeInfo(exe, uid, region string) map[string]any {
 	ctx, cancel := context.WithTimeout(context.Background(), runtimeInfoTimeout)
 	defer cancel()
-	args, withStdin := runtimeInfoArgs(runtime.GOOS)
+	args, withStdin := runtimeInfoArgs(runtime.GOOS, region)
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Dir = filepath.Dir(exe)
 	if withStdin {
@@ -415,18 +446,25 @@ func runRuntimeInfo(exe, uid string) map[string]any {
 // runtimeInfoExePath locates the official bridge, or "" when this host
 // cannot have one (disabled, client not installed).
 //
-// Windows layout (hub capture): the launcher records the real install dir
-// in %LOCALAPPDATA%\<Qoder...>\<...Launcher>\state.ini (installDir=...);
-// %LOCALAPPDATA%\Programs\<name> is the fallback layout.
+// v0.8.67: discovery is REGION-SCOPED (magpie 0.2.30). Qoder CN is its own
+// app with its own install dirs — CN reads Qoder CN's helper and never the
+// international one's, and vice versa:
 //
-// Linux layout (v0.8.43, official deb extracted): the package installs to
-// /opt/Qoder with the bridge at /opt/Qoder/resources/umid/runtime-info.
-// macOS layout: Electron default bundle path (best-effort — QD_UMID_BIN is
-// the authoritative override there; no official dmg was dissected).
+//	Linux    CN /opt/Qoder-CN (the .deb)          intl /opt/Qoder
+//	macOS    CN "Qoder CN.app"/"QoderCN.app"     intl "Qoder.app"
+//	Windows  CN "Qoder CN"/"QoderCN"             intl "Qoder"
 //
-// QD_UMID_BIN (any platform) wins over all discovery: container
-// deployments drop the official binary anywhere and point the plugin at
-// it. QD_NATIVE_IDENTITY=0/false/no disables the native layer entirely.
+// Both regions also read their CLI's cached bridge (qoderclicn for CN,
+// qodercli for intl): <config>/.bin/runtime-info-<platform>-<arch>-<hash>
+// files (a umid-win32-<arch>-<hash> folder on Windows), newest mtime wins,
+// where <config> is QODERCN_CONFIG_DIR / QODER_CONFIG_DIR or
+// (QODERCN_CLI_HOME | QODER_CLI_HOME | GEMINI_CLI_HOME | home) joined with
+// QODERCN_CONFIG_DIR_NAME (".qoder-cn") / QODER_CONFIG_DIR_NAME (".qoder").
+//
+// Env overrides, strongest first: QD_UMID_BIN (any region, the container
+// escape hatch since v0.8.43), then QODERCN_RUNTIME_INFO (CN) /
+// QODER_RUNTIME_INFO (intl). QD_NATIVE_IDENTITY=0/false/no disables the
+// native layer entirely.
 func runtimeInfoExePath(region string) string {
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("QD_NATIVE_IDENTITY"))); v == "0" || v == "false" || v == "no" {
 		return ""
@@ -437,20 +475,124 @@ func runtimeInfoExePath(region string) string {
 		}
 		return ""
 	}
+	cn := normalizeRegion(region) == regionCN
+	if p := strings.TrimSpace(os.Getenv(overrideEnvFor(cn))); p != "" {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+		return ""
+	}
 	switch runtime.GOOS {
 	case "windows":
 		return runtimeInfoExePathWindows(region)
 	case "darwin":
-		for _, app := range []string{"/Applications/Qoder.app", "/Applications/Qoder CN.app", "/Applications/QoderCN.app"} {
+		var apps []string
+		if cn {
+			apps = []string{"/Applications/Qoder CN.app", "/Applications/QoderCN.app"}
+		} else {
+			apps = []string{"/Applications/Qoder.app"}
+		}
+		for _, app := range apps {
 			if exe := umidExe(app + "/Contents"); exe != "" {
 				return exe
 			}
 		}
-		return ""
+		return cliRuntimeCacheExe(cn)
 	default:
-		// Official deb root (sha256-verified extraction).
-		return umidExe("/opt/Qoder")
+		// Official deb roots (sha256-verified extraction; CN's own .deb
+		// installs under /opt/Qoder-CN — magpie 0.2.30, Qoder-CN 0.4.9).
+		roots := []string{"/opt/Qoder"}
+		if cn {
+			roots = []string{"/opt/Qoder-CN", "/opt/Qoder"}
+		}
+		for _, root := range roots {
+			if exe := umidExe(root); exe != "" {
+				return exe
+			}
+		}
+		return cliRuntimeCacheExe(cn)
 	}
+}
+
+// overrideEnvFor names the region's runtime-info env override.
+func overrideEnvFor(cn bool) string {
+	if cn {
+		return "QODERCN_RUNTIME_INFO"
+	}
+	return "QODER_RUNTIME_INFO"
+}
+
+// cliRuntimeCacheDir resolves the CLI's config dir for one region — where
+// qoderclicn / qodercli cache the bridge they extract from their own npm
+// bundles (magpie 0.2.30: <config>/.bin/runtime-info-<platform>-<arch>-<hash>;
+// a umid-win32-<arch>-<hash> folder holding runtime-info.exe on Windows).
+func cliRuntimeCacheDir(cn bool) string {
+	envPrefix, defaultDir := "QODER_", ".qoder"
+	if cn {
+		envPrefix, defaultDir = "QODERCN_", ".qoder-cn"
+	}
+	if v := strings.TrimSpace(os.Getenv(envPrefix + "CONFIG_DIR")); v != "" {
+		return v
+	}
+	home := os.Getenv(envPrefix + "CLI_HOME")
+	if home == "" {
+		home = os.Getenv("GEMINI_CLI_HOME")
+	}
+	if home == "" {
+		if h, err := os.UserHomeDir(); err == nil {
+			home = h
+		}
+	}
+	if home == "" {
+		return ""
+	}
+	name := strings.TrimSpace(os.Getenv(envPrefix + "CONFIG_DIR_NAME"))
+	if name == "" {
+		name = defaultDir
+	}
+	return filepath.Join(home, name)
+}
+
+// cliRuntimeCacheExe finds the newest cached bridge in the region CLI's
+// config .bin, or "" (magpie 0.2.30 discovery semantics).
+func cliRuntimeCacheExe(cn bool) string {
+	config := cliRuntimeCacheDir(cn)
+	if config == "" {
+		return ""
+	}
+	bin := filepath.Join(config, ".bin")
+	entries, err := os.ReadDir(bin)
+	if err != nil {
+		return ""
+	}
+	best, bestTime := "", time.Time{}
+	if runtime.GOOS == "windows" {
+		// the CLI caches a umid-win32-<arch>-<hash> FOLDER per version
+		for _, e := range entries {
+			if !e.IsDir() || !strings.HasPrefix(e.Name(), "umid-win32-") {
+				continue
+			}
+			exe := filepath.Join(bin, e.Name(), "runtime-info.exe")
+			if st, err := os.Stat(exe); err == nil && !st.IsDir() {
+				if best == "" || st.ModTime().After(bestTime) {
+					best, bestTime = exe, st.ModTime()
+				}
+			}
+		}
+		return best
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), "runtime-info") {
+			continue
+		}
+		exe := filepath.Join(bin, e.Name())
+		if st, err := os.Stat(exe); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+			if best == "" || st.ModTime().After(bestTime) {
+				best, bestTime = exe, st.ModTime()
+			}
+		}
+	}
+	return best
 }
 
 func runtimeInfoExePathWindows(region string) string {
@@ -462,7 +604,7 @@ func runtimeInfoExePathWindows(region string) string {
 		}
 		base = filepath.Join(home, "AppData", "Local")
 	}
-	names := []string{"Qoder CN", "QoderCN", "Qoder"}
+	names := []string{"Qoder CN", "QoderCN"}
 	if normalizeRegion(region) == regionIntl {
 		names = []string{"Qoder"}
 	}
@@ -480,7 +622,19 @@ func runtimeInfoExePathWindows(region string) string {
 			return umidExe(d)
 		}
 	}
-	return ""
+	// machine-wide installers (magpie 0.2.30: electron-builder's
+	// ProgramFiles layout, as VS Code's system setup places it)
+	for _, name := range names {
+		for _, root := range []string{os.Getenv("ProgramFiles"), os.Getenv("ProgramW6432")} {
+			if strings.TrimSpace(root) == "" {
+				continue
+			}
+			if exe := umidExe(filepath.Join(root, name)); exe != "" {
+				return exe
+			}
+		}
+	}
+	return cliRuntimeCacheExe(normalizeRegion(region) == regionCN)
 }
 
 func umidExe(installDir string) string {

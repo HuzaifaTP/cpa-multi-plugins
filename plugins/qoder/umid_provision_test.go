@@ -21,7 +21,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -283,9 +285,14 @@ func TestProvisionEndToEnd(t *testing.T) {
 	// tarballURL is filled in after the server starts; the handler only
 	// reads it while serving, so plain closure capture is safe.
 	var tarballURL string
+	var cnFetches, intlFetches int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/registry":
+		case "/registry/@qoder-ai/qodercli":
+			intlFetches++
+			w.Write(bytes.ReplaceAll(metaRaw, []byte("%TARBALL%"), []byte(tarballURL)))
+		case "/registry/@qodercn-ai/qoderclicn":
+			cnFetches++
 			w.Write(bytes.ReplaceAll(metaRaw, []byte("%TARBALL%"), []byte(tarballURL)))
 		case "/tarball":
 			w.Write(tgz.Bytes())
@@ -300,9 +307,12 @@ func TestProvisionEndToEnd(t *testing.T) {
 	defer func() { umidRegistryURL = prevURL }()
 	resetUmidProvisionState(t)
 
-	exe, err := provisionUmidBridge()
+	exe, err := provisionUmidBridge(regionIntl)
 	if err != nil {
-		t.Fatalf("provisionUmidBridge: %v", err)
+		t.Fatalf("provisionUmidBridge(intl): %v", err)
+	}
+	if !strings.HasSuffix(exe, filepath.Join("intl", "runtime-info")) {
+		t.Fatalf("intl bridge must install under the intl region dir, got %q", exe)
 	}
 	st, err := os.Stat(exe)
 	if err != nil {
@@ -316,8 +326,22 @@ func TestProvisionEndToEnd(t *testing.T) {
 		t.Fatalf("provisioned bridge bytes mismatch: err=%v len=%d want %d", err, len(onDisk), len(blob))
 	}
 	// second call must come from the disk cache, not a re-download
-	if exe2 := provisionedRuntimeInfo(); exe2 != exe {
+	if exe2 := provisionedRuntimeInfo(regionIntl); exe2 != exe {
 		t.Fatalf("provisionedRuntimeInfo cache miss: %q != %q", exe2, exe)
+	}
+	// v0.8.67: CN provisions from its OWN package into its OWN dir — a
+	// different document URL, a different install path, an independent
+	// cooldown (magpie 0.2.30: CN reads Qoder CN's helper, never the
+	// international one's)
+	cnExe, err := provisionUmidBridge(regionCN)
+	if err != nil {
+		t.Fatalf("provisionUmidBridge(cn): %v", err)
+	}
+	if cnExe == exe || !strings.HasSuffix(cnExe, filepath.Join("cn", "runtime-info")) {
+		t.Fatalf("cn bridge must install under the cn region dir, got %q", cnExe)
+	}
+	if cnFetches == 0 || intlFetches == 0 {
+		t.Fatalf("region split not honored: cnFetches=%d intlFetches=%d", cnFetches, intlFetches)
 	}
 }
 
@@ -332,16 +356,25 @@ func TestProvisionedRuntimeInfoCooldownAndDisable(t *testing.T) {
 	defer func() { umidHTTPFetch = prevFetch }()
 	resetUmidProvisionState(t)
 
-	if exe := provisionedRuntimeInfo(); exe != "" {
+	if exe := provisionedRuntimeInfo(regionIntl); exe != "" {
 		t.Fatalf("failed provisioning must fall back to derived, got %q", exe)
 	}
-	if exe := provisionedRuntimeInfo(); exe != "" {
+	if exe := provisionedRuntimeInfo(regionIntl); exe != "" {
 		t.Fatalf("cooldown retry returned %q", exe)
 	}
 	if fetches != 1 {
 		t.Fatalf("cooldown not honored: %d fetch rounds, want 1 (registry+tarball share one stub)", fetches)
 	}
-	if msg := umidProvisionLastError(); msg == "" || !bytes.Contains([]byte(msg), []byte("stub registry down")) {
+	// the CN region has its own cooldown clock — it still gets its try
+	resetUmidProvisionState(t)
+	fetches = 0
+	if exe := provisionedRuntimeInfo(regionCN); exe != "" {
+		t.Fatalf("cn failed provisioning must fall back to derived, got %q", exe)
+	}
+	if fetches != 1 {
+		t.Fatalf("cn cooldown clock not independent: %d fetch rounds, want 1", fetches)
+	}
+	if msg := umidProvisionLastError(regionCN); msg == "" || !bytes.Contains([]byte(msg), []byte("stub registry down")) {
 		t.Fatalf("provision error not surfaced for diagnostics: %q", msg)
 	}
 
@@ -349,7 +382,7 @@ func TestProvisionedRuntimeInfoCooldownAndDisable(t *testing.T) {
 	t.Setenv("QD_UMID_AUTO", "0")
 	resetUmidProvisionState(t)
 	fetches = 0
-	if exe := provisionedRuntimeInfo(); exe != "" {
+	if exe := provisionedRuntimeInfo(regionIntl); exe != "" {
 		t.Fatalf("disabled provisioning must return empty, got %q", exe)
 	}
 	if fetches != 0 {
@@ -369,19 +402,18 @@ func resetUmidProvisionState(t *testing.T) {
 	dir := t.TempDir()
 	prevOverride := umidStateDirOverride
 	umidStateDirOverride = func() string { return dir }
+	clearUmidState := func() {
+		umidProvisionStateMu.Lock()
+		umidProvisionPath = map[string]string{}
+		umidProvisionErr = map[string]string{}
+		umidProvisionAt = map[string]time.Time{}
+		umidProvisionStateMu.Unlock()
+	}
 	t.Cleanup(func() {
 		umidStateDirOverride = prevOverride
-		umidProvisionStateMu.Lock()
-		umidProvisionPath = ""
-		umidProvisionErr = ""
-		umidProvisionAt = time.Time{}
-		umidProvisionStateMu.Unlock()
+		clearUmidState()
 	})
-	umidProvisionStateMu.Lock()
-	umidProvisionPath = ""
-	umidProvisionErr = ""
-	umidProvisionAt = time.Time{}
-	umidProvisionStateMu.Unlock()
+	clearUmidState()
 }
 
 // sha512Sum64 is the test-side digest helper for npm-style integrity lines.

@@ -38,12 +38,13 @@ func billingBaseFor(sa *storedAuth) string {
 // is INSENSITIVE to this value (0.3.4 / 0.4.3 / 0.5.0 return byte-identical
 // envelopes — the v0.8.47 "0.3.4 restores the daily row" causality was
 // coincidental), and issue #27's captured desktop client sends 0.4.3 on both
-// regions. Aligned back to 0.4.3: the value rides every billing request as an
-// identity header, and being a full minor behind the shipping client is a
-// pointless risk variable.
+// regions. v0.8.67 aligns to 1.1.69: magpie 0.2.23 / plugins#281 read it off
+// the shipping desktop's own header builder — Cosy-Version claims the
+// desktop worker runtime (1.1.69), not the CLI's 1.1.49 — and the H-series
+// insensitivity proof makes the bump a zero-risk freshness alignment.
 const (
 	billingClientType = "10"
-	billingClientVer  = "0.4.3"
+	billingClientVer  = "1.1.69"
 )
 
 // billingHeaders sets the shared billing auth + identity headers.

@@ -192,11 +192,14 @@ func TestScheduleSummary(t *testing.T) {
 
 // TestUmidRegistryURLFromEnv: QD_UMID_REGISTRY mirror override (v0.8.66 —
 // escape hatch for Docker deployments whose network cannot reach npmjs).
+// v0.8.67: the value is a registry BASE; the region's package path is
+// appended by umidPackageDocURL (intl @qoder-ai/qodercli, cn
+// @qodercn-ai/qoderclicn).
 func TestUmidRegistryURLFromEnv(t *testing.T) {
 	cases := []struct {
 		name, env, want string
 	}{
-		{"empty-keeps-default", "", umidRegistryURLDefault},
+		{"empty-keeps-default", "", umidRegistryBaseDefault},
 		{"mirror", "https://registry.npmmirror.com", "https://registry.npmmirror.com"},
 		{"trailing-slash-trimmed", "https://registry.npmmirror.com/", "https://registry.npmmirror.com"},
 		{"scheme-inferred", "registry.npmmirror.com", "https://registry.npmmirror.com"},
@@ -209,5 +212,25 @@ func TestUmidRegistryURLFromEnv(t *testing.T) {
 				t.Fatalf("umidRegistryURLFromEnv() = %q, want %q", got, c.want)
 			}
 		})
+	}
+}
+
+// TestUmidPackageDocURLRegionSplit (v0.8.67, magpie 0.2.30): each region
+// provisions its OWN npm package — CN from @qodercn-ai/qoderclicn (Qoder
+// CN's CLI), intl from @qoder-ai/qodercli — both reachable through the same
+// QD_UMID_REGISTRY mirror base.
+func TestUmidPackageDocURLRegionSplit(t *testing.T) {
+	base := "https://registry.example.com"
+	prev := umidRegistryURL
+	umidRegistryURL = base
+	defer func() { umidRegistryURL = prev }()
+	if got := umidPackageDocURL(regionCN); got != base+umidPkgCN {
+		t.Fatalf("umidPackageDocURL(cn) = %q, want %q", got, base+umidPkgCN)
+	}
+	if got := umidPackageDocURL(regionIntl); got != base+umidPkgIntl {
+		t.Fatalf("umidPackageDocURL(intl) = %q, want %q", got, base+umidPkgIntl)
+	}
+	if got := umidPackageDocURL("global"); got != base+umidPkgIntl {
+		t.Fatalf("umidPackageDocURL(global) = %q, want the intl package (normalizeRegion alias)", got)
 	}
 }

@@ -184,22 +184,39 @@ func TestMachineIdentityHintDerivedDisclosesSimulatedSource(t *testing.T) {
 	}
 }
 
-// runtimeInfoArgsDialectTable (v0.8.43, official-package forensics): the
-// spawn dialect must byte-match the client bundle's IUt function —
-// win32/darwin spawn `runtime-info prod --account-stdin` with the account
-// JSON on stdin; linux spawns `runtime-info prod` with stdin ignored.
+// runtimeInfoArgsDialectTable (v0.8.43 official-package forensics; v0.8.67
+// region-scoped per magpie 0.2.30): the spawn dialect must byte-match the
+// clients' own — win32/darwin spawn `runtime-info <env> --account-stdin`
+// with the account JSON on stdin; linux spawns `runtime-info <env>` with
+// stdin ignored. <env> is the region's UMID environment: 0 for Qoder CN
+// (desktop 0.4.9 `regionCode === "global" ? 3 : 0`, CLI ONLINE), 3 for
+// international (US_ONLINE). Sandbox-verified 2026-10-23: the bridge
+// accepts 0/3/prod and emits the same shape — 0/3 are the clients' own.
 func TestRuntimeInfoArgsDialectTable(t *testing.T) {
 	for goos, want := range map[string]struct {
 		args      []string
 		withStdin bool
 	}{
-		"windows": {[]string{"prod", "--account-stdin"}, true},
-		"darwin":  {[]string{"prod", "--account-stdin"}, true},
-		"linux":   {[]string{"prod"}, false},
+		"windows": {[]string{"0", "--account-stdin"}, true},
+		"darwin":  {[]string{"0", "--account-stdin"}, true},
+		"linux":   {[]string{"0"}, false},
 	} {
-		args, withStdin := runtimeInfoArgs(goos)
+		args, withStdin := runtimeInfoArgs(goos, regionCN)
 		if strings.Join(args, " ") != strings.Join(want.args, " ") || withStdin != want.withStdin {
-			t.Fatalf("runtimeInfoArgs(%q) = %v,%v want %v,%v", goos, args, withStdin, want.args, want.withStdin)
+			t.Fatalf("runtimeInfoArgs(%q, cn) = %v,%v want %v,%v", goos, args, withStdin, want.args, want.withStdin)
+		}
+	}
+	for goos, want := range map[string]struct {
+		args      []string
+		withStdin bool
+	}{
+		"windows": {[]string{"3", "--account-stdin"}, true},
+		"darwin":  {[]string{"3", "--account-stdin"}, true},
+		"linux":   {[]string{"3"}, false},
+	} {
+		args, withStdin := runtimeInfoArgs(goos, regionIntl)
+		if strings.Join(args, " ") != strings.Join(want.args, " ") || withStdin != want.withStdin {
+			t.Fatalf("runtimeInfoArgs(%q, intl) = %v,%v want %v,%v", goos, args, withStdin, want.args, want.withStdin)
 		}
 	}
 }
@@ -234,14 +251,15 @@ func TestQDUmidBinNativeBridgeEndToEnd(t *testing.T) {
 	if !strings.HasPrefix(id.MachineToken, "P1gAE2E") || id.MachineType != "38de1ce79191f25e8b" || id.MachineCode != "a2452fe300901c05e5" {
 		t.Fatalf("identity values not mapped from bridge output: %+v", id)
 	}
-	// Official dialect on linux: the environment argument only — no
+	// Official dialect on linux (v0.8.67, magpie 0.2.30): the region's
+	// UMID environment argument only — 0 for this cn-lineage region, no
 	// --account-stdin flag, stdin ignored (bundle IUt).
 	argsRaw, err := os.ReadFile(filepath.Join(dir, "args.txt"))
 	if err != nil {
 		t.Fatalf("fake bridge args missing: %v", err)
 	}
-	if got := strings.TrimSpace(string(argsRaw)); got != "prod" {
-		t.Fatalf("linux dialect args = %q, want %q", got, "prod")
+	if got := strings.TrimSpace(string(argsRaw)); got != "0" {
+		t.Fatalf("linux dialect args = %q, want %q", got, "0")
 	}
 	// Machine-level cache: the same region returns the SAME identity
 	// without re-running the bridge (30-minute TTL, native only).
@@ -250,6 +268,107 @@ func TestQDUmidBinNativeBridgeEndToEnd(t *testing.T) {
 		t.Fatalf("native identity not region-cached: %+v vs %+v", again, id)
 	}
 	machineIdentityCache.Delete(region)
+}
+
+// TestRegionRuntimeInfoEnvOverrides (v0.8.67, magpie 0.2.30): each region
+// has its OWN runtime-info env override — QODERCN_RUNTIME_INFO for CN,
+// QODER_RUNTIME_INFO for intl — and neither reads the other's (magpie:
+// "QODERCN_RUNTIME_INFO names its runtime; QODER_RUNTIME_INFO is the
+// international one's"). QD_UMID_BIN stays the universal override on top.
+func TestRegionRuntimeInfoEnvOverrides(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("discovery probing is filesystem-based; skipping on %s", runtime.GOOS)
+	}
+	t.Setenv("QD_NATIVE_IDENTITY", "")
+	t.Setenv("QD_UMID_BIN", "")
+	t.Setenv("QODER_RUNTIME_INFO", "")
+	t.Setenv("QODERCN_RUNTIME_INFO", "")
+	defer func() {
+		os.Unsetenv("QODER_RUNTIME_INFO")
+		os.Unsetenv("QODERCN_RUNTIME_INFO")
+	}()
+	dir := t.TempDir()
+	cnExe := filepath.Join(dir, "cn-bridge")
+	intlExe := filepath.Join(dir, "intl-bridge")
+	for _, p := range []string{cnExe, intlExe} {
+		if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+			t.Fatalf("write stub: %v", err)
+		}
+	}
+	// CN's override points at its own bridge; intl's override is NOT read
+	// for CN and vice versa.
+	t.Setenv("QODERCN_RUNTIME_INFO", cnExe)
+	if got := runtimeInfoExePath(regionCN); got != cnExe {
+		t.Fatalf("runtimeInfoExePath(cn) = %q, want the QODERCN_RUNTIME_INFO bridge %q", got, cnExe)
+	}
+	if got := runtimeInfoExePath(regionIntl); got == cnExe {
+		t.Fatalf("intl must not read QODERCN_RUNTIME_INFO, got %q", got)
+	}
+	t.Setenv("QODER_RUNTIME_INFO", intlExe)
+	if got := runtimeInfoExePath(regionIntl); got != intlExe {
+		t.Fatalf("runtimeInfoExePath(intl) = %q, want the QODER_RUNTIME_INFO bridge %q", got, intlExe)
+	}
+}
+
+// TestCLIRuntimeCacheDiscovery (v0.8.67, magpie 0.2.30): both regions read
+// their OWN CLI's cached bridge — qoderclicn keeps it under .qoder-cn/.bin
+// (runtime-info-<platform>-<arch>-<hash>), qodercli under .qoder/.bin — and
+// neither region ever reads the other's cache dir.
+func TestCLIRuntimeCacheDiscovery(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skipf("cache layout probing is filesystem-based; skipping on %s", runtime.GOOS)
+	}
+	t.Setenv("QD_NATIVE_IDENTITY", "")
+	t.Setenv("QD_UMID_BIN", "")
+	t.Setenv("QODER_RUNTIME_INFO", "")
+	t.Setenv("QODERCN_RUNTIME_INFO", "")
+	t.Setenv("QODER_CONFIG_DIR", "")
+	t.Setenv("QODER_CLI_HOME", "")
+	t.Setenv("QODERCN_CONFIG_DIR", "")
+	t.Setenv("QODERCN_CLI_HOME", "")
+	t.Setenv("GEMINI_CLI_HOME", "")
+	for _, k := range []string{"QODER_RUNTIME_INFO", "QODERCN_RUNTIME_INFO", "QODER_CONFIG_DIR", "QODER_CLI_HOME", "QODERCN_CONFIG_DIR", "QODERCN_CLI_HOME", "GEMINI_CLI_HOME"} {
+		defer os.Unsetenv(k)
+	}
+
+	home := t.TempDir()
+	cnBin := filepath.Join(home, ".qoder-cn", ".bin")
+	intlBin := filepath.Join(home, ".qoder", ".bin")
+	if err := os.MkdirAll(cnBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(intlBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cnBridge := filepath.Join(cnBin, "runtime-info-linux-x64-9f2c1a")
+	intlBridge := filepath.Join(intlBin, "runtime-info-linux-x64-77e0b3")
+	for _, p := range []string{cnBridge, intlBridge} {
+		if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+			t.Fatalf("write cache stub: %v", err)
+		}
+	}
+	t.Setenv("QODERCN_CLI_HOME", home)
+	t.Setenv("QODER_CLI_HOME", home)
+	if got := runtimeInfoExePath(regionCN); got != cnBridge {
+		t.Fatalf("runtimeInfoExePath(cn) = %q, want the .qoder-cn/.bin cache %q", got, cnBridge)
+	}
+	if got := runtimeInfoExePath(regionIntl); got != intlBridge {
+		t.Fatalf("runtimeInfoExePath(intl) = %q, want the .qoder/.bin cache %q", got, intlBridge)
+	}
+	// QODERCN_CONFIG_DIR relocates the whole config dir (qoderclicn semantics)
+	moved := t.TempDir()
+	movedBin := filepath.Join(moved, ".bin")
+	if err := os.MkdirAll(movedBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	movedBridge := filepath.Join(movedBin, "runtime-info-linux-x64-deadbe")
+	if err := os.WriteFile(movedBridge, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("QODERCN_CONFIG_DIR", moved)
+	if got := runtimeInfoExePath(regionCN); got != movedBridge {
+		t.Fatalf("runtimeInfoExePath(cn) with QODERCN_CONFIG_DIR = %q, want %q", got, movedBridge)
+	}
 }
 
 // TestMachineIdentityHintDerivedMentionsEscapeHatch (v0.8.44): the

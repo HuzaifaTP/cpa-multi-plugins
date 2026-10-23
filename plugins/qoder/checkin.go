@@ -427,6 +427,17 @@ func checkinOneAccount(f pluginapi.HostAuthFileEntry) map[string]any {
 		if msg, ok := res["message"].(string); ok && msg != "" {
 			out["message"] = msg
 		}
+		// v0.8.67 (magpie 0.2.30 semantics): an empty offer list plus a
+		// non-native identity is the signature of the server hiding
+		// device-targeted rows from a request it does not recognize —
+		// Qoder CN moved the daily 100 Credits into the desktop's
+		// 权益中心 and its campaigns pages stopped offering the row to
+		// requests without Qoder CN's own device identity. Say how to
+		// get one instead of a bare "nothing claimable".
+		if mi := machineIdentityFor(authRegion(sa), sa.Account.UID, false); mi.Source != identitySourceNative {
+			out["message"] = fmt.Sprintf("%v；未取得官方设备身份（runtime-info）——安装%s桌面端或其 CLI 并登录一次，或设 %s / QD_UMID_BIN 指向 runtime-info 可执行文件",
+				out["message"], regionDisplayName(authRegion(sa)), overrideEnvFor(authRegion(sa) == regionCN))
+		}
 		return out
 	}
 	// v0.8.40: the bypass probe surfaces the dedup verdict — a sibling

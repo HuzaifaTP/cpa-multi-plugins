@@ -1642,10 +1642,10 @@ func campaignIdleDiagnosis(status *campaignStatusResponse, sa *storedAuth) strin
 			switch {
 			case !umidProvisionEnabled():
 				line += "；本机已关闭身份桥自动供给（QD_UMID_AUTO=0）——可放置官方客户端 resources/umid/runtime-info 并以 QD_UMID_BIN 指定其路径"
-			case umidProvisionLastError() != "":
-				line += "；身份桥自动供给失败（" + umidProvisionLastError() + "），将自动重试；容器网络访问 npmjs 受限时可设 QD_UMID_REGISTRY=https://registry.npmmirror.com 走镜像，或用 QD_UMID_BIN 指定官方 runtime-info"
+			case umidProvisionLastError(region) != "":
+				line += "；身份桥自动供给失败（" + umidProvisionLastError(region) + "），将自动重试；容器网络访问 npmjs 受限时可设 QD_UMID_REGISTRY=https://registry.npmmirror.com 走镜像，或用 QD_UMID_BIN 指定官方 runtime-info"
 			default:
-				line += "；插件将从官方 npm 包自动供给身份桥（一次性下载约 31MB），成功后下一次签到即用真机身份"
+				line += "；插件将从官方 npm 包自动供给身份桥（一次性下载约 31MB，CN 账号取 @qodercn-ai/qoderclicn、国际账号取 @qoder-ai/qodercli），成功后下一次签到即用真机身份"
 			}
 			return line
 		}

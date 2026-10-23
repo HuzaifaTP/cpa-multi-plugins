@@ -50,6 +50,15 @@ func normalizeRegion(v string) string {
 	}
 }
 
+// regionDisplayName renders a region for operator-facing messages
+// (v0.8.67: the check-in identity guidance names the client to install).
+func regionDisplayName(region string) string {
+	if normalizeRegion(region) == regionIntl {
+		return "Qoder"
+	}
+	return "Qoder CN"
+}
+
 // authRegion resolves the region of one stored account:
 //  1. explicit auth.region (written by login + adoption),
 //  2. legacy fallback: domain sniff (qoder.sh / qoder.com without .cn → intl),
