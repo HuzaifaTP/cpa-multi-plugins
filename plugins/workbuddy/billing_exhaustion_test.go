@@ -194,6 +194,13 @@ func TestBillingErrClassifications(t *testing.T) {
 	eof := errString(`Post "https://www.codebuddy.cn/v2/billing/meter/get-user-resource": EOF`)
 	reset := errString(`Post "https://www.codebuddy.cn/v2/billing/meter/get-user-resource": read: connection reset by peer`)
 	tlsErr := errString(`tls: failed to verify certificate: x509: certificate signed by unknown authority`)
+	// 0.9.66 (CI flake 2026-10-23): both are the transport cutting the wire
+	// under us — a pooled keep-alive conn the peer (CDN/EdgeOne idle reaping,
+	// the accept-then-close test edge) closed, and a body truncated mid-read.
+	// They must ride the demote/retry ladder like any other conn-level death,
+	// not escape it as an unclassified one-shot error.
+	idleClosed := errString(`Post "http://demote-ladder.test:36637/v2/billing/meter/get-user-resource": http: server closed idle connection`)
+	truncated := errString(`Post "https://www.codebuddy.cn/v2/billing/meter/get-user-resource": unexpected EOF`)
 	business := errString(`code=10000 msg=down`)
 	parse := errString(`parse failed: invalid character '<'`)
 	// The field-report shape under the HTTP-200 envelope: the server's own
@@ -208,7 +215,7 @@ func TestBillingErrClassifications(t *testing.T) {
 	if is5xxBillingErr(eof) || is5xxBillingErr(business) {
 		t.Fatal("EOF / business codes are not 5xx")
 	}
-	for _, e := range []error{eof, reset, tlsErr} {
+	for _, e := range []error{eof, reset, tlsErr, idleClosed, truncated} {
 		if !isConnLevelBillingErr(e) {
 			t.Fatalf("%v must classify as connection-level", e)
 		}

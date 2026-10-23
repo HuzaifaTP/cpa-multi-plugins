@@ -344,6 +344,8 @@ func isConnLevelBillingErr(err error) bool {
 	msg := msgOf(err)
 	for _, pat := range []string{
 		": EOF",
+		"server closed idle connection", // Go transport: pooled keep-alive conn cut by the peer (CDN/EdgeOne idle reaping) — 0.9.66, CI flake 2026-10-23
+		"unexpected EOF",                // truncated response body mid-read — same transport class
 		"connection reset",
 		"broken pipe",
 		"TLS handshake timeout",

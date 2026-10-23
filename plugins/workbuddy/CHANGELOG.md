@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.66
+
+### Idle-connection cuts ride the billing retry ladder
+
+The v0.9.65 CI guard first run (v0.8.80 tag, 2026-10-23) caught a taxonomy gap: Go's transport surfaces a peer-closed pooled keep-alive connection as `http: server closed idle connection`, and a body truncated mid-read as `unexpected EOF` — neither matched `isConnLevelBillingErr`'s patterns, so both escaped the demote/retry ladder as unclassified one-shot errors instead of demoting the cached-good IP and retrying (exactly what a CDN reaping idle conns — EdgeOne included — produces in production, not only under test timing).
+
+- Both errors now classify as connection-level and ride the same ladder as EOF/reset/TLS deaths: demote the IP, walk onto the next candidate, and only report exhaustion after the full 4 attempts.
+- The taxonomy test pins the two new shapes alongside the existing EOF/reset/TLS cases; the embedded-upstream-text guard (business code quoting the gateway's internal `: EOF`) still wins first, so app-layer answers keep their classification.
+
 ## 0.9.65
 
 ### Billing transport survives poisoned DNS, and 5xx stops masquerading as "unreachable"
