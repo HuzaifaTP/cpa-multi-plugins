@@ -84,6 +84,9 @@ func buildChatBody(payload []byte, upstreamModel string, stream bool) (string, e
 	if len(payload) == 0 {
 		return "", fmt.Errorf("empty chat payload")
 	}
+	// Plugin-side content-gate scrubbing: rewrite the client's own trigger
+	// phrases before the body is pinned for the upstream (see sanitize_prompt.go).
+	payload = scrubPromptPayload(payload)
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &obj); err != nil {
 		return "", fmt.Errorf("payload parse: %w", err)
