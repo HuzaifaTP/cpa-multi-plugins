@@ -30,8 +30,9 @@ import (
 	"time"
 )
 
-// growthDesktopUA 实测桌面客户端 UA（5.5.6 内嵌 CLI 2.137.1）。
-const growthDesktopUA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+// growthDesktopUA 实测桌面客户端 UA（v0.9.69 / issue #56：2026-10-18 抓包对齐至
+// 5.8.3 内嵌 CLI 2.161.0；版本常量单一来源于 fingerprint.go）。
+const growthDesktopUA = "WorkBuddy/" + desktopClientVersion + " WorkBuddy/" + desktopClientVersion + " CLI/" + desktopBundledCLIVersion
 
 // growthDesktopAppearanceSet 桌面外观设置端点（chat 域）。
 const growthDesktopAppearanceSet = "/v2/user-asset/appearance/set"
@@ -76,11 +77,11 @@ func growthDesktopFingerprint(sa *storedAuth) map[string]any {
 		"commit":       "5f9692923c93033111c51ad7b003eb80204a9b75",
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
-		"ideVersion":   "5.5.6",
+		"ideVersion":   desktopClientVersion,
 		"machineId":    growthDeriveID(sa, "machine"),
 		"sessionId":    growthDeriveID(sa, "session"),
 		"extName":      "workbuddy-desktop",
-		"extVersion":   "5.5.6",
+		"extVersion":   desktopClientVersion,
 		"os":           "win32",
 		"arch":         "x64",
 		"osVersion":    "10.0.26220",

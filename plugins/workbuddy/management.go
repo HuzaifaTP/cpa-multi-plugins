@@ -167,6 +167,8 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodPost, Path: base + "/keepalive", Description: "Manually refresh access tokens for all accounts (or one with auth_index)."},
 			{Method: http.MethodGet, Path: base + "/keepalive/status", Description: "Last keepalive run summary + config."},
 			{Method: http.MethodGet, Path: base + "/models/groups", Description: "Per-realm model catalog (model_cache snapshots; ?refresh=1 re-discovers) for the panel's exclusion picker."},
+			{Method: http.MethodGet, Path: base + "/excluded-models", Description: "Per-credential model exclusion list (?auth_index=) — the account-level narrowing channel rules can't express."},
+			{Method: http.MethodPost, Path: base + "/excluded-models", Description: "Set one credential's excluded model list ({auth_index, models:[]}); empty list removes the field."},
 		},
 		Resources: []resourceRoute{
 			{Path: "/panel", Menu: "WorkBuddy", Description: "WorkBuddy dashboard: credits, check-in, plan, import."},
@@ -241,6 +243,14 @@ func handleManagement(raw []byte) ([]byte, error) {
 	case req.Method == http.MethodGet && path == base+"/models/groups":
 		status, payload := handleModelGroupsQuery(req)
 		return okEnvelope(mgmtJSONResponse(status, payload))
+	case req.Method == http.MethodGet && path == base+"/excluded-models":
+		// Issue #56 (v0.9.69): per-credential model exclusions — read side.
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleExcludedModelsGet(req)))
+	case req.Method == http.MethodPost && path == base+"/excluded-models":
+		// Issue #56 (v0.9.69): per-credential model exclusions — write side
+		// (merges into the physical doc through the hostAuthSaveJSON funnel,
+		// so the preserve whitelist defends it on every later rebuild).
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleExcludedModelsSet(req)))
 	}
 	return okEnvelope(mgmtJSONResponse(http.StatusNotFound, map[string]any{"error": "not found: " + path}))
 }

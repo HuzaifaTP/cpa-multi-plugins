@@ -130,7 +130,16 @@ func fetchDynamicModelsFromStorage(storageJSON []byte) []pluginapi.ModelInfo {
 	// v0.9.25: overlay runtime-learned alias→real display names on every
 	// branch (pin / static / cache-hit / fresh discovery) — a mapping learned
 	// mid-TTL must reach the host without waiting for cache expiry.
-	return applyLearnedAliasNames(list)
+	list = applyLearnedAliasNames(list)
+	// v0.9.69 (issue #56): the credential's own exclusion list is the last
+	// word on what THIS account advertises — an education account that only
+	// answers for a subset of the realm's 54 models drops the unauthorized
+	// ones here, so the host's routing pool never sends them to it (they
+	// would bounce as 400 code 11136 and mark the credential failed).
+	// Filtered after the alias overlay so both the alias name and the real
+	// id are matched against the user's list. Channel-level rules still
+	// apply on the host side; this is per-credential narrowing only.
+	return filterModelsForCredential(list, storageJSON)
 }
 
 func fetchDynamicModelsFromStorageInner(storageJSON []byte) []pluginapi.ModelInfo {

@@ -86,8 +86,11 @@ const (
 	// Intl chat/auth gateway (merged codebuddy-intl plugin, v0.11.0):
 	// the codebuddy.ai realm issues its own JWTs — separate from both
 	// copilot.tencent.com and workbuddy.ai.
-	upstreamBaseIntl    = "https://www.codebuddy.ai"
-	clientUA            = "CLI/2.108.1 CodeBuddy/2.108.1"
+	upstreamBaseIntl = "https://www.codebuddy.ai"
+	// v0.9.69 (issue #56): official CLI package observed at 2.168.2 on
+	// 2026-10-18 (workbuddy2api-hub captures) — the CLI identity UA rides
+	// the current value instead of sitting three minors behind.
+	clientUA            = "CLI/2.168.2 CodeBuddy/2.168.2"
 	originReferer       = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 	originRefererIntl   = "https://www.codebuddy.ai"
@@ -348,7 +351,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.9.68"
+var version = "0.9.69"
 
 func wbRegistration() registration {
 	return registration{
@@ -627,7 +630,14 @@ func backendHeaders(req *http.Request, sa *storedAuth) {
 	if req.Header.Get("X-IDE-Name") == "" {
 		req.Header.Set("X-IDE-Name", "WorkBuddy")
 		req.Header.Set("X-IDE-Type", "WorkBuddy")
-		req.Header.Set("X-IDE-Version", "5.5.6")
+		req.Header.Set("X-IDE-Version", desktopClientVersion)
+	}
+	// v0.9.69 (issue #56): the CLI identity carries the OpenAI Node SDK
+	// fingerprint family the official CLI's bundled SDK sends on chat
+	// calls (6.25.0 shape, real OS/arch). IDE-identity logins keep their
+	// own CodeBuddyIDE family — mixing the two would be a new mismatch.
+	if !isIDEPlatform(platformForAuth(sa)) {
+		applyStainlessHeaders(req)
 	}
 	// 2026-10-19 (PR #43): the Global realm's gateway rejects otherwise-valid
 	// streaming chat calls with 11128 "request illegal" ("This call failed

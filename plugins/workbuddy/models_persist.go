@@ -226,6 +226,15 @@ func samePersistedModels(a, b []pluginapi.ModelInfo) bool {
 // fields that CPA's auth manager writes into the file (proxy_url / weight /
 // priority / prefix / label / request_retry / headers). The typed rebuilds
 // used to reset them to defaults on every note churn.
+//
+// v0.9.69 (issue #56): the credential-level exclusion list joins the
+// whitelist. The host's watcher synthesizer honors a per-credential
+// "excluded_models" (it merges the file's list into auth.Attributes and the
+// model registry applies it per auth), but the field never survived a
+// plugin-side typed rebuild — every note churn wiped it within seconds of a
+// hand edit, so the per-account narrowing issue #56 asks for was unreachable
+// through the documented mechanism. Both spellings (underscore and hyphen)
+// are preserved; serve-layer filtering lives in excluded_models.go.
 var preservedPluginDocKeys = []string{
 	modelCacheDocKey,
 	"proxy_url",
@@ -235,6 +244,8 @@ var preservedPluginDocKeys = []string{
 	"label",
 	"request_retry",
 	"headers",
+	"excluded_models",
+	"excluded-models",
 }
 
 func preservePluginDocKeys(name string, doc []byte) []byte {
@@ -263,6 +274,7 @@ func preservePluginDocKeys(name string, doc []byte) []byte {
 		return doc
 	}
 	restored := false
+	restoredKeys := make([]string, 0, len(needed))
 	for _, k := range needed {
 		raw, ok := prev[k]
 		if !ok || len(raw) == 0 {
@@ -270,10 +282,16 @@ func preservePluginDocKeys(name string, doc []byte) []byte {
 		}
 		have[k] = raw
 		restored = true
+		restoredKeys = append(restoredKeys, k)
 	}
 	if !restored {
 		return doc
 	}
+	// v0.9.69 (issue #56): one log line per restore — when an operator
+	// reports fields "vanishing" from credential files, this is the
+	// audit trail that shows the whitelist fighting back (and which
+	// keys it rescued from which file).
+	log.Printf("models: preserved key(s) %s re-injected into %s after typed rebuild", strings.Join(restoredKeys, ","), name)
 	merged, err := json.Marshal(have)
 	if err != nil {
 		return doc

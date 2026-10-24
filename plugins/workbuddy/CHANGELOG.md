@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.69
+
+### Per-credential model exclusions survive and apply (issue #56)
+
+Field report (2026-10-24): an education/enterprise account in a shared CN channel advertises the realm's full 54-model catalog but is only authorized for a subset — the rest answer 400 `11136 model not allowed`, so every poll onto the account burns an upstream round trip and marks the credential failed. Channel-level exclusion (config.yaml `oauth-excluded-models`) removes those models from EVERY account on the channel, and the host's documented per-credential list (top-level `excluded_models` in the auth file, merged by the watcher synthesizer into `auth.Attributes` and applied per-auth at model registration) never survived on disk: every plugin-side typed rebuild (lifecycle note churn, check-in status) reconstructed the document without it, and the field wasn't in the `preservePluginDocKeys` whitelist — wiped within seconds of a hand edit.
+
+- `excluded_models` (and the hyphen spelling `excluded-models`) joined the `preservePluginDocKeys` whitelist — typed rebuilds now re-inject the field from the physical document exactly the way `model_cache` has survived since v0.9.38. Restores are logged (`preserved key(s) … re-injected into …`) so field-vanishing reports have an audit trail.
+- The serve layer filters each credential's advertised list through its own exclusion (`fetchDynamicModelsFromStorage`, after the alias overlay, covering the pin/cache/discovery/snapshot branches alike). Matching is the host's own semantics — trim, lowercase, `*` wildcard — so the plugin's filter and the host's registry filter can never disagree. An empty/absent list still means "no opinion": channel-level rules keep applying.
+- New management endpoints give the per-account narrowing a real UI path instead of hand-edited files: `GET /v0/management/plugins/workbuddy/excluded-models?auth_index=…` reads the current list; `POST` with `{auth_index, models:[…]}` merges it into the physical document through the `hostAuthSaveJSON` funnel (normalize + preserve), and an empty list removes the field entirely.
+- The import endpoint no longer bypasses the funnel: `handleImportAuth` ran a raw `host.auth.save` that skipped `preservePluginDocKeys`, so re-importing an existing credential started the document over (wiping `model_cache` and operator fields).
+
+### Request fingerprint rides current client versions (issue #56)
+
+Same report: the plugin's identity strings sat three minors behind the reference implementations' 2026-10-18 captures — `CLI/2.108.1` vs the CLI package's `2.168.2`, desktop `5.5.6`/CLI `2.137.1` vs `5.8.3`/`2.161.0`, `X-IDE-Version: 5.5.6` vs `5.8.3`, and no OpenAI SDK fingerprint at all. Not a wire-correctness bug, but every request reading as a stale client is free risk surface against the 11128 channel-verification family.
+
+- `clientUA` → `CLI/2.168.2 CodeBuddy/2.168.2`; desktop UA (growth event plane) → `WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0`; `X-IDE-Version` and the growth fingerprint's `ideVersion`/`extVersion` → `5.8.3`. Version constants live in one place (`fingerprint.go`) so the next bump is a single edit.
+- CLI-identity chat calls now carry the OpenAI Node SDK fingerprint family the official CLI's bundled SDK sends: `X-Stainless-Lang/Package-Version/OS/Arch/Runtime/Runtime-Version` (6.25.0 shape), with OS/arch mapped from the REAL runtime platform (darwin→macOS, amd64→x64). IDE-identity logins keep their CodeBuddyIDE family untouched — mixing the two would be a new mismatch, not an alignment.
+
 ## 0.9.68
 
 ### A billing 401 renews once and sends once more (magpie packages/workbuddy 0.1.31)

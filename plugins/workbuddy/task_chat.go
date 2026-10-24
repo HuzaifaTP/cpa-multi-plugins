@@ -153,7 +153,7 @@ func growthChatStream(sa *storedAuth, model, expertID, userPrompt string, withSy
 		req.Header.Set("X-Agent-Type", "main")
 		req.Header.Set("X-IDE-Name", "WorkBuddy")
 		req.Header.Set("X-IDE-Type", "WorkBuddy")
-		req.Header.Set("X-IDE-Version", "5.5.6")
+		req.Header.Set("X-IDE-Version", desktopClientVersion)
 		req.Header.Set("x-codebuddy-request", "1")
 		if expertID != "" {
 			req.Header.Set("X-Expert-Id", expertID)

@@ -64,6 +64,13 @@ func handleImportAuth(req pluginapi.ManagementRequest) map[string]any {
 		return map[string]any{"success": false, "error": err.Error()}
 	}
 	auth := toAuthData(sa)
+	// v0.9.69 (issue #56): re-importing a credential that already exists
+	// must not wipe the whitelisted fields the on-disk document carries
+	// (model_cache, excluded_models, operator fields). The raw
+	// host.auth.save below used to bypass the hostAuthSaveJSON funnel —
+	// and with it preservePluginDocKeys — so every re-import started the
+	// document over from the typed rebuild.
+	fileJSON = preservePluginDocKeys(auth.FileName, fileJSON)
 	saveReq := pluginapi.HostAuthSaveRequest{
 		Name: auth.FileName,
 		JSON: fileJSON,
