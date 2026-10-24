@@ -109,6 +109,9 @@ var (
 	// (persistLoginCredential): tests stub it to record the save instead of
 	// touching the host bridge.
 	hostAuthPersistFn = hostAuthPersist
+	// hostAuthSaveJSONFn lives in models_persist.go's seam block — the
+	// persist paths here (persistAuthTokens / markSessionDead) route
+	// through it too.
 )
 
 func hostAuthGetPhysical(authIndex string) (*hostAuthPhysical, error) {

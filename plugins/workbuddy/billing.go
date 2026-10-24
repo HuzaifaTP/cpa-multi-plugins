@@ -224,6 +224,31 @@ func billingCall(sa *storedAuth, path string, body any) (json.RawMessage, error)
 		attempts++
 		all5xx = all5xx && is5xxBillingErr(err)
 	}
+	// 0.9.68 (magpie packages/workbuddy 0.1.31 parity): a billing 401 gets
+	// ONE token renewal and ONE resend, whatever the token's clock says.
+	// The keepalive refresh keeps offline sessions alive on its own schedule;
+	// a session that died between keepalive ticks used to surface as a hard
+	// failure on every billing call until the next daily cycle.
+	if err != nil && is401BillingRejection(err) {
+		fresh, rerr := billing401RenewOnce(sa)
+		switch {
+		case rerr == nil && fresh != nil:
+			data, err = billingCallOnce(fresh, path, body, 0)
+			if err == nil {
+				return data, nil
+			}
+			if is401BillingRejection(err) {
+				err = fmt.Errorf("%w — renewed once and still refused: re-login required", err)
+			}
+		case isBilling401SessionDead(rerr):
+			err = fmt.Errorf("%w — refresh token refused (session dead): re-login required", err)
+		default:
+			// Throttled / snapshot without host identity / no refresh token /
+			// renewal failed for another reason: keep the plain 401 shape —
+			// the next cycle retries the heal, or a concurrent renewal has
+			// already refreshed the credential for callers that re-read it.
+		}
+	}
 	if err != nil && isTransientBillingErr(err) {
 		// Transport-class exhaustion: keep the underlying error first (its
 		// `Post "url": EOF` shape stays greppable and transient-classified),

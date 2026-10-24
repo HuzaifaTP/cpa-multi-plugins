@@ -100,17 +100,22 @@ func foreignAuthOwner(entryType, entryProvider string) (bool, string) {
 
 // hostAuthGet fetches the credential JSON for one auth index.
 func hostAuthGet(authIndex string) (*storedAuth, error) {
-	phys, err := hostAuthGetPhysical(authIndex)
+	phys, err := hostAuthGetPhysicalFn(authIndex)
 	if err != nil {
 		return nil, err
 	}
-	return parseStored(phys.JSON)
+	sa, err := parseStored(phys.JSON)
+	if err != nil {
+		return nil, err
+	}
+	sa.authIndex = authIndex
+	return sa, nil
 }
 
 // hostAuthGetBundle is one host.auth.get for both storage and physical metadata
 // (avoids the previous double-RPC in dashboard: get + getPhysical).
 func hostAuthGetBundle(authIndex string) (*storedAuth, *hostAuthPhysical, error) {
-	phys, err := hostAuthGetPhysical(authIndex)
+	phys, err := hostAuthGetPhysicalFn(authIndex)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -118,5 +123,6 @@ func hostAuthGetBundle(authIndex string) (*storedAuth, *hostAuthPhysical, error)
 	if err != nil {
 		return nil, phys, err
 	}
+	sa.authIndex = authIndex
 	return sa, phys, nil
 }

@@ -348,7 +348,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.9.67"
+var version = "0.9.68"
 
 func wbRegistration() registration {
 	return registration{
@@ -455,6 +455,13 @@ var modelAliasCache struct {
 type storedAuth struct {
 	Auth    storedTokens  `json:"auth"`
 	Account storedAccount `json:"account"`
+
+	// authIndex is the host-side identity of this credential, stamped by
+	// hostAuthGet / hostAuthGetBundle (empty for hand-built snapshots: tests,
+	// pre-persist login flows). The billing plane's 401 self-heal (0.9.68)
+	// uses it to renew and persist the token in place. Unexported on purpose:
+	// encoding/json skips it, so the persisted document shape is unchanged.
+	authIndex string
 }
 
 type storedTokens struct {
@@ -589,7 +596,15 @@ func endpointChatFor(sa *storedAuth) string {
 	return upstreamBaseFor(sa) + "/v2/chat/completions"
 }
 
+// refreshEndpointOverride（0.9.68 测试缝）：非空时把 /token/refresh 端点重定向
+// 到该 base（与 loginEndpointsOverride 同型）。生产恒为空；billing 401 自愈
+// 的 hermetic 测试用它驱动完整的 401→续期→重发链路。
+var refreshEndpointOverride string
+
 func endpointTokenRefreshFor(sa *storedAuth) string {
+	if refreshEndpointOverride != "" {
+		return refreshEndpointOverride + "/v2/plugin/auth/token/refresh"
+	}
 	return upstreamBaseFor(sa) + "/v2/plugin/auth/token/refresh"
 }
 

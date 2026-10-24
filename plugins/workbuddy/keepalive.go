@@ -160,7 +160,7 @@ func refreshOneAuth(authIndex, authID string) (string, error) {
 // The host's file watcher reloads it; we deliberately do NOT dual-write the
 // physical path (same rule as hostAuthPersist).
 func persistAuthTokens(authIndex string, sa *storedAuth) error {
-	phys, err := hostAuthGetPhysical(authIndex)
+	phys, err := hostAuthGetPhysicalFn(authIndex)
 	if err != nil {
 		return err
 	}
@@ -172,7 +172,7 @@ func persistAuthTokens(authIndex string, sa *storedAuth) error {
 	if err != nil {
 		return err
 	}
-	return hostAuthSaveJSON(name, raw)
+	return hostAuthSaveJSONFn(name, raw)
 }
 
 // mergeStoredAuthIntoDoc re-marshals the refreshed credential into the
@@ -208,7 +208,7 @@ func mergeStoredAuthIntoDoc(physJSON []byte, sa *storedAuth) ([]byte, error) {
 // the reason so the panel can surface "session dead, re-login required"
 // without needing a custom [SESSION-DEAD] marker.
 func markSessionDead(authIndex, authID string, sa *storedAuth) error {
-	phys, err := hostAuthGetPhysical(authIndex)
+	phys, err := hostAuthGetPhysicalFn(authIndex)
 	if err != nil {
 		return err
 	}
@@ -229,7 +229,7 @@ func markSessionDead(authIndex, authID string, sa *storedAuth) error {
 	if name == "" {
 		name = authFileNameFor(sa)
 	}
-	return hostAuthSaveJSON(name, raw)
+	return hostAuthSaveJSONFn(name, raw)
 }
 
 // keepaliveSummary is one row of the daily run, surfaced via the

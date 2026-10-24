@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.68
+
+### A billing 401 renews once and sends once more (magpie packages/workbuddy 0.1.31)
+
+magpie's workbuddy plugin taught this lesson on 2026-10-23 (0.1.31): "a chat or usage read WorkBuddy answers 401 is renewed once, whatever the token's time, and sent once more." Our keepalive refresh keeps offline sessions alive on a daily schedule, but a session that died between keepalive ticks surfaced as a hard failure on every billing call — check-in, usage read, enterprise meter, payment type — until the next daily cycle came around.
+
+- `billingCall` now recognizes the billing plane's two 401 shapes (the gateway's HTML credential bounce, and the JSON envelope's `code=12153` "Offline user session not found") and attempts ONE token renewal plus ONE resend before giving up.
+- A token another process saved since the snapshot is taken first, instead of spending the refresh token again; and exactly one renewal per credential per 30s window — a scheduler tick fans out into several billing calls, and rotation makes concurrent refresh spends destructive.
+- The credential is flagged dead only on the upstream's own word: the refresh itself refused with the session-dead family (12153). A 401 that survives a successful renewal surfaces with "re-login required"; every other renewal failure (throttled, snapshot without host identity, no refresh token, transport) leaves the account exactly as it was and keeps the plain 401 shape for the next cycle.
+- `storedAuth` carries its host-side auth index (unexported, JSON-invisible) so the heal can renew-and-persist in place; `hostAuthGet`/`hostAuthGetBundle` stamp it, and the persist/mark paths route through the testable seams.
+
 ## 0.9.67
 
 ### Enterprise accounts: the meter plane that answers with empty data (issue #55)
