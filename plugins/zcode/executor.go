@@ -137,10 +137,16 @@ func sessionIdFromRequest(req *http.Request) string {
 // applyStartPlanChatHeaders applies the start-plan gateway's header set:
 // identity (g6n) + the three-header trace subset (start-plan omits
 // x-query-id/x-session-id — the client has no query/session context on this
-// plane) + `Authorization: Bearer {plan JWT}` + the required
-// anthropic-version + the ai-sdk/anthropic UA suffix (bundle `Cm`/`k0o`:
-// real anthropic-kind LLM requests arrive as
+// plane) + query-source attribution + `Authorization: Bearer {plan JWT}` +
+// the required anthropic-version + the ai-sdk/anthropic UA suffix (bundle
+// `Cm`/`k0o`: real anthropic-kind LLM requests arrive as
 // `ZCode/{ver} ai-sdk/anthropic/3.0.81`).
+//
+// The set is whitelist-by-construction (every header is Set explicitly, the
+// request is built fresh), so nothing an agent sent can ride through — the
+// property magpie packages/zcode 0.1.22 had to rebuild their header setter
+// to guarantee. The endpoint is a fixed const with no query string, so an
+// agent's ?beta=true can never reach this gateway either.
 func applyStartPlanChatHeaders(req *http.Request, sa *storedAuth, body string) {
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range buildLlmIdentityHeaders(zcodeIdentity()) {
@@ -149,6 +155,11 @@ func applyStartPlanChatHeaders(req *http.Request, sa *storedAuth, body string) {
 	req.Header.Set("x-request-id", uuid.NewString())
 	req.Header.Set("x-zcode-session-type", "main")
 	req.Header.Set("x-zcode-trace-id", uuid.NewString())
+	// 0.2.4 (magpie packages/zcode 0.1.22): ZCode 3.16's
+	// createModelRequestAttributionHeaders attributes what asked the
+	// model — main_turn for a chat turn — and the start-plan gateway
+	// expects it alongside the three-header trace subset.
+	req.Header.Set("x-zcode-query-source", "main_turn")
 	req.Header.Set("Authorization", "Bearer "+sa.Auth.JWT)
 	req.Header.Set("anthropic-version", anthropicVersion)
 	ua := req.Header.Get("User-Agent")

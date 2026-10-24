@@ -59,7 +59,10 @@ const (
 
 	// zcodeAppVersion mirrors the ZCode desktop release the plugin's identity
 	// headers claim to be. Configurable via plugin config (identity_version).
-	zcodeAppVersion = "3.14.0"
+	// 3.16.3 (0.2.4): follows magpie packages/zcode 0.1.22 — the live
+	// desktop client moved, and UA / X-ZCode-App-Version / the preview's
+	// app_version query and the V4 signing gate message all ride this.
+	zcodeAppVersion = "3.16.3"
 )
 
 // cliInitData is the `data` of a successful /oauth/cli/init call.

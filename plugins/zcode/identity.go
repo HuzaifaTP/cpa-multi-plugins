@@ -174,15 +174,8 @@ func orUnknown(v string) string {
 	return v
 }
 
-// osRelease returns a best-effort OS release string for X-Os-Version.
-// Go has no direct equivalent of uname -r on every platform; on Linux the
-// /proc/sys/kernel/osrelease file is authoritative and always present on the
-// server deployments CPA targets. Other platforms fall back to empty (header
-// omitted — the client omits it when the value is non-printable too).
-func osRelease() string {
-	b, err := os.ReadFile("/proc/sys/kernel/osrelease")
-	if err != nil {
-		return ""
-	}
-	return normalizePrintableHeaderValue(string(b))
-}
+// osRelease is defined per-platform (osrelease_linux.go / osrelease_darwin.go /
+// osrelease_other.go): it returns the OS kernel release the way Node's
+// os.release() does — the value ZCode's buildZCodeSourceHeadersFromContext
+// puts in X-Os-Version, never the prompt's richer OS line (magpie packages/
+// zcode 0.1.22 pinned that distinction).

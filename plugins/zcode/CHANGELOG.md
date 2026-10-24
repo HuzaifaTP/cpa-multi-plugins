@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.4
+
+### Start Plan rides ZCode 3.16.3's exact request shape (magpie packages/zcode 0.1.22)
+
+magpie's zcode plugin rebuilt its start-plan header setter on 2026-10-23 (0.1.22): the Start Plan is served only to what looks like ZCode's own request — 3.16.3's headers and nothing else. Their worry was agent headers leaking through a gateway (Claude Code's anthropic-beta, x-app, x-stainless-*, ?beta=true); our request builder was already whitelist-by-construction and the endpoint a fixed const, so no leak was possible — but three concrete details of the 3.16.3 client had drifted past us.
+
+- `zcodeAppVersion` 3.14.0 → 3.16.3: User-Agent (`ZCode/3.16.3 ai-sdk/anthropic/3.0.81`), `X-Zcode-App-Version`, the usage preview's `app_version` query param, and the V4 signing gate message all follow the constant.
+- `x-zcode-query-source: main_turn` now rides every start-plan (and off-peak ticketed) messages call — ZCode 3.16's `createModelRequestAttributionHeaders`, what asked the model.
+- `X-Os-Version` is per-platform `os.release()` parity: Linux keeps `/proc/sys/kernel/osrelease`; darwin builds now send `kern.osrelease` (a real macOS ZCode client always carries the header — ours used to omit it).
+
 ## 0.2.3
 
 ### Multi-plan balance pools: a spent twin no longer hides the live one (issue #53)

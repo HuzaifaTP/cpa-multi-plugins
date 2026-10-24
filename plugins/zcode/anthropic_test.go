@@ -996,6 +996,17 @@ func TestHandleExecExecuteStartPlan(t *testing.T) {
 	if c.headers.Get("x-query-id") != "" || c.headers.Get("x-session-id") != "" {
 		t.Fatal("start-plan must omit x-query-id/x-session-id")
 	}
+	// 0.2.4 (magpie packages/zcode 0.1.22): 3.16's model-request
+	// attribution header and the moved app version.
+	if v := c.headers.Get("x-zcode-query-source"); v != "main_turn" {
+		t.Fatalf("x-zcode-query-source = %q", v)
+	}
+	if v := c.headers.Get("X-Zcode-App-Version"); v != "3.16.3" {
+		t.Fatalf("X-Zcode-App-Version = %q", v)
+	}
+	if !strings.HasPrefix(c.headers.Get("User-Agent"), "ZCode/3.16.3 ") {
+		t.Fatalf("UA = %q", c.headers.Get("User-Agent"))
+	}
 	if !strings.HasSuffix(c.headers.Get("User-Agent"), llmSDKUserAgentSuffix) {
 		t.Fatalf("UA = %q", c.headers.Get("User-Agent"))
 	}
