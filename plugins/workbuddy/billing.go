@@ -716,10 +716,32 @@ func fetchUserResource(sa *storedAuth) (*creditsSummary, error) {
 		}
 	}
 	_ = resp.Response.Data.TotalCount
+	// v0.9.67 (issue #55): an enterprise-space account answers the personal
+	// meter plane with HTTP 200 + EMPTY data (TotalCount 0, Accounts null) —
+	// not an error — and folding that into a zero summary made the panel read
+	// "余0 已用0 · free" for an account holding a live enterprise allowance,
+	// and kept a disabled one from ever re-enabling (shouldReenableCN wants
+	// TotalRemain > 0). Enterprise accounts with empty personal data fall back
+	// to the enterprise meter plane; a personal account's genuinely-empty
+	// result (no packs yet) never enters the fallback.
+	if len(resp.Response.Data.Accounts) == 0 && isEnterpriseAccount(sa) {
+		if u, uerr := fetchEnterpriseUsage(sa); uerr == nil {
+			return u.creditsSummary(), nil
+		}
+		// Both planes came back empty: report unknown (nil) rather than a
+		// zero summary — "no data" must not render as "exhausted".
+		return nil, fmt.Errorf("enterprise account: personal meter empty and enterprise usage unavailable")
+	}
 	return sum, nil
 }
 
 func fetchPaymentType(sa *storedAuth) string {
+	// v0.9.67 (issue #55): an enterprise account is not on the personal
+	// payment ladder — get-payment-type answers "free" there, which the panel
+	// used to render as the plan. Name the plane for what it is.
+	if isEnterpriseAccount(sa) {
+		return "enterprise"
+	}
 	data, err := billingCall(sa, "/v2/billing/meter/get-payment-type", nil)
 	if err != nil {
 		return ""
@@ -735,6 +757,13 @@ func fetchPaymentType(sa *storedAuth) string {
 }
 
 func performCheckinCall(sa *storedAuth) (map[string]any, error) {
+	// v0.9.67 (issue #55): the daily-checkin plane rejects enterprise
+	// accounts with 400 biz 10001 "企业账号不支持该操作" (and their
+	// checkin-activity-status reads active:false). Short-circuit the manual
+	// press with the reason instead of a doomed upstream call.
+	if isEnterpriseAccount(sa) {
+		return enterpriseCheckinRefusal(), nil
+	}
 	data, err := billingCall(sa, "/v2/billing/meter/daily-checkin", nil)
 	if err != nil {
 		// billingCall returns business errors (code != 0) as Go errors; surface

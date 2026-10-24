@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.67
+
+### Enterprise accounts: the meter plane that answers with empty data (issue #55)
+
+Field report (sabercomo, 2026-10-24): 企业版/教育公益版 CN accounts hold a real 2000-credit enterprise allowance and keep answering chat, but the panel read `余0 已用0 · plan: free` — because `fetchUserResource()` only walks the PERSONAL meter plane, and an enterprise account answers `/v2/billing/meter/get-user-resource` with HTTP 200 + EMPTY data (TotalCount 0, Accounts null), which folded into a zero summary instead of "unknown". The lifecycle trap: `shouldReenableCN()` demands `TotalRemain > 0`, so such an account, once disabled, would never re-enable itself.
+
+- An account with a non-empty `enterpriseId` whose personal meter comes back empty now falls back to `POST /billing/meter/get-enterprise-user-usage` (same billing gateway, same identity headers — the token already carries the enterprise identity) and surfaces one synthetic package: used = `credit`, size = `limitNum`, remain = `limitNum - credit` clamped at 0, cycle bounds from the upstream's `cycleStartTime`/`cycleEndTime`. The cycle REFILLS at `cycleResetTime` — the package is named 企业额度（周期回满）and never reads as "about to lapse".
+- Both planes empty/down reads as unknown (an error), never a zero summary masquerading as exhaustion.
+- `fetchPaymentType()` returns `enterprise` for such accounts — the personal ladder's `free` no longer stands in as the plan.
+- The manual check-in press is short-circuited with the reason (企业版账号不支持每日签到 — the daily-checkin plane rejects enterprise accounts with 400 biz 10001) instead of a doomed round trip.
+- Personal accounts never touch the enterprise plane (guard-pinned: an empty personal result for a personal account keeps its legacy zero summary and the enterprise endpoint sees zero calls).
+
 ## 0.9.66
 
 ### Idle-connection cuts ride the billing retry ladder
