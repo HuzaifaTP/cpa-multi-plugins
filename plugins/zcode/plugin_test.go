@@ -458,7 +458,7 @@ func TestQuotaSummarizeBalances(t *testing.T) {
 		{ShowName: "coding", RemainingUnits: 90, TotalUnits: 100, UsedUnits: 10, UnitType: "tokens"},
 		{ShowName: "trial", RemainingAlt: 5, UsedAlt: 1, TotalAlt: 6, UnitTypeAlt: "tokens"},
 	}
-	sum := summarizeBalances(rows)
+	sum := summarizeBalances(rows, nil, 1e12)
 	if sum.TotalRemain != 95 || sum.TotalUsed != 11 || sum.TotalSize != 106 {
 		t.Fatalf("totals: %+v", sum)
 	}
@@ -467,6 +467,91 @@ func TestQuotaSummarizeBalances(t *testing.T) {
 	}
 	if sum.Packages[0].Name != "coding (tokens)" {
 		t.Fatalf("package name: %q", sum.Packages[0].Name)
+	}
+}
+
+// TestQuotaSummarizeDualPlans pins issue #53's display half (magpie zcode
+// 0.1.23 alignment): an account holding the new-user plan AND the 1024 Dev
+// Day plan, each granting a GLM-5.3 bucket — the spent new-user bucket used
+// to read as the account's only GLM-5.3 and hide the live 1024 one.
+func TestQuotaSummarizeDualPlans(t *testing.T) {
+	now := float64(1792824000) // 2026-10-24T12:00:00Z
+	rows := []zcodeBalance{
+		// balance order: the spent new-user bucket first — the trap
+		{ShowName: "GLM-5.3", UserPlanID: "up-new", PlanID: "p-new", RemainingUnits: 0, TotalUnits: 1000, UsedUnits: 1000, UnitType: "tokens", Capabilities: []string{"model:glm-5.3"}},
+		{ShowName: "GLM-5.3", UserPlanID: "up-1024", PlanID: "p-1024", RemainingUnits: 500000000, TotalUnits: 500000000, UsedUnits: 0, UnitType: "tokens", Capabilities: []string{"model:glm-5.3"}},
+		{ShowName: "GLM-5.3-Flash", UserPlanID: "up-1024", PlanID: "p-1024", RemainingUnits: 500000000, TotalUnits: 500000000, UsedUnits: 0, UnitType: "tokens", Capabilities: []string{"model:glm-5.3-flash"}},
+		{ShowName: "coding", RemainingUnits: 90, TotalUnits: 100, UsedUnits: 10, UnitType: "tokens"},
+	}
+	plans := []zcodePlanRow{
+		{UserPlanID: "up-new", PlanID: "p-new", Name: "New User", Status: "active", EndsAt: now + 86400},
+		{UserPlanID: "up-1024", PlanID: "p-1024", Name: "ZCode 1024 Dev Day", Status: "active", EndsAt: 1793466000},
+		{UserPlanID: "up-old", PlanID: "p-old", Name: "Weekend", Status: "active", EndsAt: now - 86400},
+		{UserPlanID: "up-dead", PlanID: "p-dead", Name: "Cancelled", Status: "cancelled", EndsAt: now + 86400},
+	}
+	sum := summarizeBalances(rows, plans, now)
+	if sum.PackCount != 4 || len(sum.Packages) != 4 {
+		t.Fatalf("packages: %d", len(sum.Packages))
+	}
+	// Spendable first: the live 1024 buckets lead, plan-prefixed.
+	if sum.Packages[0].Name != "ZCode 1024 Dev Day · GLM-5.3 (tokens)" {
+		t.Fatalf("pkg0: %q", sum.Packages[0].Name)
+	}
+	if sum.Packages[1].Name != "ZCode 1024 Dev Day · GLM-5.3-Flash (tokens)" {
+		t.Fatalf("pkg1: %q", sum.Packages[1].Name)
+	}
+	// The unlinked coding bucket keeps its plain name and rides after the
+	// spent twin (spendable plan buckets first, then spent, then unlinked).
+	if sum.Packages[2].Name != "New User · GLM-5.3 (tokens)（已用尽）" {
+		t.Fatalf("pkg2: %q", sum.Packages[2].Name)
+	}
+	if sum.Packages[3].Name != "coding (tokens)" {
+		t.Fatalf("pkg3: %q", sum.Packages[3].Name)
+	}
+	// Totals still count every row: the live 1024 twin keeps the account
+	// from reading as exhausted.
+	if sum.TotalRemain != 1000000090 {
+		t.Fatalf("total remain: %d", sum.TotalRemain)
+	}
+}
+
+// TestQuotaSummarizeSinglePlanNoPrefix pins the one-plan case: buckets keep
+// their own names (the card's header already names the plan).
+func TestQuotaSummarizeSinglePlanNoPrefix(t *testing.T) {
+	now := float64(1792824000)
+	rows := []zcodeBalance{
+		{ShowName: "GLM-5.3", UserPlanID: "up-1024", RemainingUnits: 10, TotalUnits: 10, UnitType: "tokens"},
+	}
+	plans := []zcodePlanRow{
+		{UserPlanID: "up-1024", PlanID: "p-1024", Name: "ZCode 1024 Dev Day", Status: "active", EndsAt: now + 86400},
+	}
+	sum := summarizeBalances(rows, plans, now)
+	if len(sum.Packages) != 1 || sum.Packages[0].Name != "GLM-5.3 (tokens)" {
+		t.Fatalf("single plan naming: %+v", sum.Packages)
+	}
+}
+
+// TestQuotaSummarizeExpiredPlanBucket pins the expired-plan annotation: a
+// bucket whose owning plan is past its end is marked and sorted last.
+func TestQuotaSummarizeExpiredPlanBucket(t *testing.T) {
+	now := float64(1792824000)
+	rows := []zcodeBalance{
+		{ShowName: "glm-5.3-air", UserPlanID: "up-old", RemainingUnits: 50, TotalUnits: 50, UnitType: "tokens"},
+		{ShowName: "live", UserPlanID: "up-new", RemainingUnits: 5, TotalUnits: 10, UnitType: "tokens"},
+	}
+	plans := []zcodePlanRow{
+		{UserPlanID: "up-old", PlanID: "p-old", Name: "Weekend", Status: "active", EndsAt: now - 1},
+		{UserPlanID: "up-new", PlanID: "p-new", Name: "New User", Status: "active", EndsAt: now + 86400},
+	}
+	sum := summarizeBalances(rows, plans, now)
+	if len(sum.Packages) != 2 {
+		t.Fatalf("packages: %d", len(sum.Packages))
+	}
+	if sum.Packages[0].Name != "live (tokens)" {
+		t.Fatalf("pkg0: %q", sum.Packages[0].Name)
+	}
+	if sum.Packages[1].Name != "Weekend · glm-5.3-air (tokens)（已过期）" {
+		t.Fatalf("pkg1: %q", sum.Packages[1].Name)
 	}
 }
 

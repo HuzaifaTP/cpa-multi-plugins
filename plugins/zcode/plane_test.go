@@ -31,7 +31,7 @@ func TestHarvestStartPlaneCapabilities(t *testing.T) {
 		{ShowName: "GLM-5.3-Flash", Capabilities: []string{"model:glm-5.3-flash"}},
 		{ShowName: "Coding Plan", Capabilities: []string{"model:glm-5.3", "meter:token"}},
 	}
-	harvestStartPlaneCapabilities("user-1", rows)
+	harvestStartPlaneCapabilities("user-1", rows, nil, 1e12)
 	set := startPlaneModelSet("user-1")
 	if set == nil {
 		t.Fatal("no set harvested")
@@ -49,7 +49,44 @@ func TestHarvestStartPlaneCapabilities(t *testing.T) {
 		t.Fatal("harvest leaked across UIDs")
 	}
 	// Empty UID must be a no-op, not a panic.
-	harvestStartPlaneCapabilities("", rows)
+	harvestStartPlaneCapabilities("", rows, nil, 1e12)
+}
+
+// TestHarvestSkipsSpentAndExpired pins issue #53's routing half: a spent
+// bucket or one owned by a non-live plan must not contribute capabilities —
+// with two plans granting the same model the spent twin would otherwise
+// stand in for the live one on the route plane.
+func TestHarvestSkipsSpentAndExpired(t *testing.T) {
+	resetStartPlane(t)
+	planned := float64(1e12)
+	rows := []zcodeBalance{
+		{ShowName: "spent twin", UserPlanID: "up-new", RemainingUnits: 0, TotalUnits: 100, Capabilities: []string{"model:glm-5.3"}},
+		{ShowName: "live 1024", UserPlanID: "up-1024", RemainingUnits: 500, TotalUnits: 500, Capabilities: []string{"model:glm-5.3"}},
+		{ShowName: "expired plan bucket", UserPlanID: "up-old", RemainingUnits: 50, TotalUnits: 50, Capabilities: []string{"model:glm-5.3-air"}},
+		{ShowName: "unlinked coding", Capabilities: []string{"model:glm-4.7"}},
+	}
+	plans := []zcodePlanRow{
+		{UserPlanID: "up-new", PlanID: "p-new", Name: "New User", Status: "active", EndsAt: planned + 1e6},
+		{UserPlanID: "up-1024", PlanID: "p-1024", Name: "ZCode 1024 Dev Day", Status: "active", EndsAt: planned + 1e6},
+		{UserPlanID: "up-old", PlanID: "p-old", Name: "Weekend", Status: "active", EndsAt: planned - 1}, // past its end
+	}
+	harvestStartPlaneCapabilities("user-1", rows, plans, planned)
+	set := startPlaneModelSet("user-1")
+	if set == nil {
+		t.Fatal("no set harvested")
+	}
+	if _, ok := set["glm-5.3"]; !ok {
+		t.Fatalf("live 1024 bucket's glm-5.3 missing: %v", set)
+	}
+	if _, ok := set["glm-5.3-air"]; ok {
+		t.Fatalf("expired plan's model leaked into the route plane: %v", set)
+	}
+	if _, ok := set["glm-4.7"]; !ok {
+		t.Fatalf("unlinked coding bucket dropped: %v", set)
+	}
+	if len(set) != 2 {
+		t.Fatalf("unexpected model count: %v", set)
+	}
 }
 
 func TestNoteStartPlaneModelMemoizes(t *testing.T) {

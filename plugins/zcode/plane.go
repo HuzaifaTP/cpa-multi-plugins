@@ -43,18 +43,30 @@ var (
 	startPlaneTTL    = 6 * time.Hour
 )
 
-// harvestStartPlaneCapabilities folds balance-row capabilities
+// harvestStartPlaneCapabilities folds live-bucket capabilities
 // ("model:<id>") into the per-UID cache. Called after every successful
 // billing/balance parse. Rows without capabilities contribute nothing; an
 // account whose buckets carry no model capabilities keeps whatever was
 // cached before until the entry expires.
-func harvestStartPlaneCapabilities(uid string, rows []zcodeBalance) {
+//
+// Since 0.2.3 (issue #53) only buckets a request can spend now contribute:
+// a spent bucket (no remaining units) or one owned by an expired/inactive
+// plan is skipped, mirroring magpie zcode's startPlan/giftSpent — with two
+// plans granting the same model (1024 Dev Day beside the new-user plan) the
+// spent twin's capability must not stand in for the live one.
+func harvestStartPlaneCapabilities(uid string, rows []zcodeBalance, plans []zcodePlanRow, now float64) {
 	uid = strings.TrimSpace(uid)
 	if uid == "" {
 		return
 	}
 	models := make(map[string]struct{})
 	for _, row := range rows {
+		if bucketSpent(row) {
+			continue
+		}
+		if len(plans) > 0 && hasPlanLink(row) && bucketOwner(row, plans, now, true) == nil {
+			continue // linked to a plan, but no live plan owns it
+		}
 		for _, cap := range row.Capabilities {
 			cap = strings.TrimSpace(cap)
 			if !strings.HasPrefix(cap, "model:") {
@@ -71,6 +83,13 @@ func harvestStartPlaneCapabilities(uid string, rows []zcodeBalance) {
 	startPlaneMu.Lock()
 	startPlaneModels[uid] = &startPlaneEntry{models: models, fetched: time.Now()}
 	startPlaneMu.Unlock()
+}
+
+// hasPlanLink reports whether a balance row carries any plan ownership
+// marker (user_plan_id or plan_id) — only then does the live-owner check
+// apply; unlinked rows (the coding-plane buckets) ride on as before.
+func hasPlanLink(b zcodeBalance) bool {
+	return strings.TrimSpace(b.UserPlanID) != "" || strings.TrimSpace(b.PlanID) != ""
 }
 
 // noteStartPlaneModel memoizes a reactively discovered JWT-plane model.

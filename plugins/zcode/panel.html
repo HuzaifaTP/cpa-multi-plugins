@@ -307,7 +307,7 @@ async function loadPreview(){
   if(data.error){box.innerHTML='<div class="card err">'+escHtml(data.error)+'</div>';return}
   const plans=data.plans||[];
   if(!plans.length){
-    box.innerHTML='<div class="card"><h2>当前没有可领取的活动</h2><div class="sub">活动由服务端按账号与时段下发；已领取过的活动不会再出现在列表里。</div></div>';
+    box.innerHTML='<div class="card"><h2>当前没有可领取的活动</h2><div class="sub">活动由服务端按账号与时段下发；已领取过的活动不会再出现在列表里。邀请制/定向活动（如 1024 Dev Day 邀请礼包）由官网通道下发，不经过本列表——在官网领取后，对应额度池会直接出现在上方的余量区。</div></div>';
     return;
   }
   let html='<div class="card"><h2>可领取活动（'+plans.length+'）</h2><div class="khint">点击「领取」弹出阿里云验证码：低风险环境无感通过（等于一键领取），否则拖动滑块完成人机验证，通过后插件立即向上游提交领取。领取账号为当前选中的路由账号；成功后余量区会出现对应额度池。</div></div><div class="grid">';

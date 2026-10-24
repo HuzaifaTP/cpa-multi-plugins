@@ -36,11 +36,29 @@ type zcodeBalance struct {
 	UnitType       string  `json:"unit_type"`
 	UnitTypeAlt    string  `json:"unitType"`
 	ExpiresAt      float64 `json:"expires_at"`
+	UserPlanID     string  `json:"user_plan_id"`
+	PlanID         string  `json:"plan_id"`
 	// Capabilities carries the bucket's model scope ("model:glm-5.3-flash")
 	// — the entitlement-plane routing input (plane.go). Measured live
 	// 2026-09-27: weekend-activity buckets name exactly the models their
 	// grant covers.
 	Capabilities []string `json:"capabilities"`
+}
+
+// zcodePlanRow is one entry of the balance response's plans array — the
+// plan metadata the gift card reads (magpie-community/plugins zcode
+// giftOf: "several plans can be active at once, and a model routes to the
+// gift when any of them has a live bucket serving it"). A bucket names its
+// owner through user_plan_id (preferred) or plan_id; the 1024 Dev Day /
+// new-user coexistence (issue #53, magpie zcode 0.1.23) surfaced this plane:
+// two live plans can each grant the same model, and without the owner link
+// a spent bucket and a live one are indistinguishable on the panel.
+type zcodePlanRow struct {
+	UserPlanID string  `json:"user_plan_id"`
+	PlanID     string  `json:"plan_id"`
+	Name       string  `json:"name"`
+	Status     string  `json:"status"`
+	EndsAt     float64 `json:"ends_at"`
 }
 
 func (b zcodeBalance) remaining() float64 {
@@ -74,6 +92,7 @@ type balanceResponse struct {
 	ServerTime int64  `json:"server_time"`
 	Data       struct {
 		Balances []zcodeBalance `json:"balances"`
+		Plans    []zcodePlanRow `json:"plans"`
 	} `json:"data"`
 }
 
@@ -113,15 +132,93 @@ func fetchQuotaSnapshot(sa *storedAuth) (*creditsSummary, error) {
 	if out.Code != 0 {
 		return nil, fmt.Errorf("billing balance: code=%d msg=%s", out.Code, out.Msg)
 	}
-	// Entitlement-plane harvest: bucket capabilities feed routeFor's model
-	// routing so JWT-plane packages (activity/trial buckets) pre-route
-	// without waiting for a coding-plane 1113 (plane.go).
-	harvestStartPlaneCapabilities(sa.Account.UID, out.Data.Balances)
-	return summarizeBalances(out.Data.Balances), nil
+	// Entitlement-plane harvest: live-bucket capabilities feed routeFor's
+	// model routing so JWT-plane packages (activity/trial buckets) pre-route
+	// without waiting for a coding-plane 1113 (plane.go). Spent and expired
+	// buckets no longer contribute — with two plans granting the same model
+	// (issue #53) a spent bucket's capability must not shadow the live one.
+	now := float64(out.ServerTime)
+	if now <= 0 {
+		now = float64(time.Now().Unix())
+	}
+	harvestStartPlaneCapabilities(sa.Account.UID, out.Data.Balances, out.Data.Plans, now)
+	return summarizeBalances(out.Data.Balances, out.Data.Plans, now), nil
 }
 
-// summarizeBalances folds balance rows into the panel's creditsSummary.
-func summarizeBalances(rows []zcodeBalance) *creditsSummary {
+// balancePlanKey dedupes a plan by its ownership identity.
+func balancePlanKey(p zcodePlanRow) string {
+	return strings.TrimSpace(p.UserPlanID) + "\x00" + strings.TrimSpace(p.PlanID)
+}
+
+// sameBalancePlan mirrors magpie giftOf's `same`: a balance row and a plan
+// belong together when their user_plan_id pair matches (preferred — one
+// plan can be granted twice), falling back to plan_id equality.
+func sameBalancePlan(b zcodeBalance, p zcodePlanRow) bool {
+	bu, pu := strings.TrimSpace(b.UserPlanID), strings.TrimSpace(p.UserPlanID)
+	if bu != "" && pu != "" {
+		return bu == pu
+	}
+	return strings.TrimSpace(b.PlanID) == strings.TrimSpace(p.PlanID)
+}
+
+// planLive reports whether a plan row is live: status active and its end
+// (when the server states one) still ahead. Magpie rewrites an active plan
+// past its end to "expired" before matching; we compare directly.
+func planLive(p zcodePlanRow, now float64) bool {
+	if !strings.EqualFold(strings.TrimSpace(p.Status), "active") {
+		return false
+	}
+	return p.EndsAt <= 0 || p.EndsAt > now
+}
+
+// bucketSpent mirrors magpie giftSpent: a bucket with no remaining units is
+// spent (our tolerant parser reads an absent remaining as 0, so a bucket
+// that names a total but no remainder counts as spent — the safe side for
+// both display and routing).
+func bucketSpent(b zcodeBalance) bool {
+	return b.total() > 0 && b.remaining() <= 0
+}
+
+// bucketOwner finds the plan a balance row belongs to. live=true searches
+// only live plans (magpie's gift-card read); live=false searches every plan
+// (to tell "an expired plan's bucket" from "no plan at all").
+func bucketOwner(b zcodeBalance, plans []zcodePlanRow, now float64, live bool) *zcodePlanRow {
+	for i := range plans {
+		if live && !planLive(plans[i], now) {
+			continue
+		}
+		if sameBalancePlan(b, plans[i]) {
+			return &plans[i]
+		}
+	}
+	return nil
+}
+
+// summarizeBalances folds balance rows into the panel's creditsSummary,
+// plan-aware since 0.2.3 (issue #53, magpie zcode 0.1.23 alignment):
+//
+//   - when more than one live plan holds buckets, every bucket is named
+//     after its plan ("ZCode 1024 Dev Day · GLM-5.3") so a spent pool and
+//     a live one granting the same model are told apart on the panel;
+//   - buckets a request can spend now list first, spent ones next, buckets
+//     of an expired/inactive plan last (each group keeps the balance's
+//     order) — a spent plan listed first used to hide the live plan's
+//     allowance for the same model;
+//   - totals still sum every row, so a live bucket keeps an account with a
+//     spent twin from reading as exhausted.
+func summarizeBalances(rows []zcodeBalance, plans []zcodePlanRow, now float64) *creditsSummary {
+	liveSet := map[string]struct{}{}
+	for _, p := range plans {
+		if planLive(p, now) {
+			liveSet[balancePlanKey(p)] = struct{}{}
+		}
+	}
+	several := len(liveSet) > 1
+	type classified struct {
+		pkg  packageSummary
+		rank int
+	}
+	out := make([]classified, 0, len(rows))
 	sum := &creditsSummary{PackCount: len(rows)}
 	for i, b := range rows {
 		remain, used, total := int64(b.remaining()), int64(b.used()), int64(b.total())
@@ -135,9 +232,37 @@ func summarizeBalances(rows []zcodeBalance) *creditsSummary {
 		if ut := strings.TrimSpace(b.unitType()); ut != "" {
 			name += " (" + ut + ")"
 		}
-		sum.Packages = append(sum.Packages, packageSummary{
+		rank := 2 // no plan linkage: the coding-plane buckets, unchanged
+		if owner := bucketOwner(b, plans, now, true); owner != nil {
+			if several {
+				name = strings.TrimSpace(owner.Name) + " · " + name
+			}
+			if bucketSpent(b) {
+				rank = 1
+			} else {
+				rank = 0
+			}
+		} else if anyOwner := bucketOwner(b, plans, now, false); anyOwner != nil {
+			rank = 3 // the plan exists but is expired/inactive
+			name = strings.TrimSpace(anyOwner.Name) + " · " + name
+		}
+		switch rank {
+		case 1:
+			name += "（已用尽）"
+		case 3:
+			name += "（已过期）"
+		}
+		out = append(out, classified{packageSummary{
 			Name: name, Remain: remain, Used: used, Size: total,
-		})
+		}, rank})
+	}
+	// Stable ordering by rank: spendable first, spent next, unlinked, expired.
+	for r := 0; r <= 3; r++ {
+		for _, c := range out {
+			if c.rank == r {
+				sum.Packages = append(sum.Packages, c.pkg)
+			}
+		}
 	}
 	return sum
 }
