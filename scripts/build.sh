@@ -15,11 +15,13 @@ echo "Target: $TARGET_OS/$TARGET_ARCH"
 echo "Plugins dir: $PLUGINS_DIR"
 echo ""
 
-# 插件清单（v0.12.0 收敛为 3 个统一插件）
+# 插件清单（与 release.yml 的五插件矩阵一致）
 PLUGINS=(
   "workbuddy"
   "qoder"
   "trae"
+  "zcode"
+  "mimo"
 )
 
 # 输出目录
