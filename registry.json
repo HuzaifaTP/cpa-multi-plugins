@@ -82,7 +82,7 @@
       "name": "Trae",
       "description": "Trae unified provider for CPA (merged v0.12.0): Trae Code CN (api.trae.cn inline_chat), Trae SOLO CN (solo_work_lite) and Trae Intl (api.marscode.com Web SOLO) in one plugin, per-variant routing, real-time SSE, daily check-in, auto-adopts legacy trae-cn / trae-solo-cn / trae-intl auth files.",
       "author": "mmqz",
-      "version": "0.12.79",
+      "version": "0.12.80",
       "changelog": "One sign-in device for the whole login (#47): the URL, ExchangeToken, credential and bound refresh all carry the same device — the callback no longer swaps to the per-account derived identity (fixes 401 20403 on every fresh CN/intl login).",
       "repository": "https://github.com/mmqz/cpa-multi-plugins",
       "homepage": "https://github.com/mmqz/cpa-multi-plugins/tree/main/plugins/trae",

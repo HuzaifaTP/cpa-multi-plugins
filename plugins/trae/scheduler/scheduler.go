@@ -181,8 +181,11 @@ func (s *Scheduler) RunCheckinNow() {
 				// v0.12.40: credits 语义修正——status.credits 是"签到可领奖励"
 				// （官方卡片 "Daily check-in: {credits} credits"），签到后不会增长，
 				// 旧的"签到后-签到前"差值算法作废。入账证据优先取 claim 响应
-				// 携带的数额，缺省回退签到前奖励配置（基础 + 加码）。
-				awarded := status.Credits + status.ExtraCredits
+				// 携带的数额。
+				// v0.12.80: 回退不再 credits+extra_credits 相加（zhujiu 实测双计，
+				// magpie ba9801c 同日同修，详见 upstream.CheckinAwarded）——
+				// 取其一：credits 优先，仅 credits<=0 时取 extra。
+				awarded := upstream.CheckinAwarded(status.Credits, status.ExtraCredits)
 				if claim.ClaimCredits != nil {
 					awarded = *claim.ClaimCredits
 				}
@@ -192,7 +195,7 @@ func (s *Scheduler) RunCheckinNow() {
 					log.Printf("checkin %s: claimed +%d, recheck failed: %v — will retry today", st.UID, awarded, stErr)
 					rateLimited++
 				case after.CheckedIn || after.DidCheckedIn:
-					log.Printf("checkin %s: ok +%d (reward was %d+%d)", st.UID, awarded, status.Credits, status.ExtraCredits)
+					log.Printf("checkin %s: ok +%d (credits=%d extra=%d, take-one v0.12.80)", st.UID, awarded, status.Credits, status.ExtraCredits)
 					status = after
 				default:
 					log.Printf("checkin %s: claim code=0 but recheck did not confirm check-in (credits %d -> %d) — will retry today", st.UID, status.Credits, after.Credits)

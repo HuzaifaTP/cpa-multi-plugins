@@ -733,8 +733,10 @@ func handleManualCheckin(req pluginapi.ManagementRequest) map[string]any {
 		// v0.12.40: credits 语义修正（反编译官方 TraeWork CN 2.3.81345 定案）——
 		// status.credits 是"每日签到奖励数额"（官方卡片 "Daily check-in:
 		// {credits} credits"），非钱包余额；签到后不增长，旧"签到后-签到前"
-		// 差值算法作废。入账证据优先取 claim 响应携带的数额，缺省回退
-		// 签到前奖励配置（基础 credits + 加码 extra_credits）。
+		// 差值算法作废。入账证据优先取 claim 响应携带的数额。
+		// v0.12.80: 回退不再 credits+extra_credits 相加（zhujiu 实测双计，
+		// magpie ba9801c 同日同修，详见 upstream.CheckinAwarded）——
+		// 取其一：credits 优先，仅 credits<=0 时取 extra。
 		beforeCredits := status.Credits
 		awarded := int64(-1)
 		claimAccepted := false // v0.12.61: claim 返回 code:0（含幂等回声）→ 上游接受了本次领取
@@ -760,7 +762,8 @@ func handleManualCheckin(req pluginapi.ManagementRequest) map[string]any {
 					entry["claim_credits"] = *claim.ClaimCredits
 					awarded = *claim.ClaimCredits
 				} else {
-					awarded = beforeCredits + status.ExtraCredits
+					// v0.12.80: 回退取其一（credits 优先），不再相加——见上方 v0.12.80 注记。
+					awarded = upstream.CheckinAwarded(beforeCredits, status.ExtraCredits)
 				}
 				// 领取成功后重查状态（对齐官方 workbench claim 后 refresh）。
 				if after, stErr := upstreamClient.CheckinStatus(a, did); stErr == nil {

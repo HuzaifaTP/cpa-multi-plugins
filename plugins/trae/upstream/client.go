@@ -577,8 +577,12 @@ type CheckinStatusResult struct {
 	DidCheckedIn bool  `json:"did_checked_in"`
 	Credits      int64 `json:"credits"`
 	// ExtraCredits 官方字段 extra_credits：会员/活动加码奖励（官方卡片
-	// "Member bonus: +{extraCredits} daily"）。到账总额 = credits + extra_credits。
-	// v0.12.31 "官方依次给 200 面板却是 150"悬案即源于此（150 基础 + 50 加码）。
+	// "Member bonus: +{extraCredits} daily"）。v0.12.80 语义修正：credits
+	// 与 extra_credits 是同一份当日奖励的两种表述，实际到账取其一而非
+	// 相加（zhujiu 实测 Trae CN credits=100 + extra=100 显示 200 实到 100；
+	// magpie ba9801c 同日同修，取数优先级 claim.credits > claim.extra_credits
+	// > status.credits）。v0.12.31 "官方依次给 200 面板却是 150"悬案的旧
+	// 相加解释作废，该悬案本身很可能即双计误读。
 	ExtraCredits int64  `json:"extra_credits"`
 	Enable       bool   `json:"enable"`
 	Code         int32  `json:"code"` // 业务码：0=成功，9074=活动校验拒绝，其他=会话类失败
@@ -906,6 +910,19 @@ func (c *Client) CheckinClaim(a *auth.Auth, deviceID ...string) (*CheckinClaimRe
 		lastBiz.Msg += " " + ugProbeDetail(a, attempted)
 	}
 	return nil, lastBiz
+}
+
+// CheckinAwarded 计算签到入账数额的回退语义（v0.12.80）：
+// claim 响应携带数额时调用方优先采用 ClaimCredits，本函数处理响应不带
+// 数额的回退——credits 与 extra_credits 取其一（credits 优先，仅
+// credits<=0 时取 extra），永不相加：zhujiu 实测 Trae CN
+// credits=100 + extra_credits=100 面板显示 200 实际只到账 100，
+// 旧相加算法自 v0.12.31 起双计了会员加码（magpie ba9801c 同日同修）。
+func CheckinAwarded(credits, extra int64) int64 {
+	if credits > 0 {
+		return credits
+	}
+	return extra
 }
 
 // pickCreditField 从签到 claim 响应中 best-effort 提取入账数额。
