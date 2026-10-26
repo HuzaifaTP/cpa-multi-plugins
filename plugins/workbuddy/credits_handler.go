@@ -255,6 +255,9 @@ func handleCreditsQuery(req pluginapi.ManagementRequest) map[string]any {
 				"label":      f.Label,
 				"disabled":   f.Disabled,
 				"selected":   getActiveAuthID() == f.ID,
+				// #59: always name the outbound family currently in use — the panel
+				// surface for the opt-in lane switch (login family when no switch).
+				"identity_family": identityFamilyFor(sa),
 			}
 			if err != nil {
 				acct["error"] = err.Error()
@@ -297,11 +300,12 @@ func handleCreditsQuery(req pluginapi.ManagementRequest) map[string]any {
 	}
 	// All accounts: return simplified list.
 	type acctCredits struct {
-		AuthIndex string          `json:"auth_index"`
-		Nickname  string          `json:"nickname"`
-		UID       string          `json:"uid"`
-		Credits   *creditsSummary `json:"credits,omitempty"`
-		Error     string          `json:"error,omitempty"`
+		AuthIndex      string          `json:"auth_index"`
+		Nickname       string          `json:"nickname"`
+		UID            string          `json:"uid"`
+		IdentityFamily string          `json:"identity_family"` // #59: the lane currently in use
+		Credits        *creditsSummary `json:"credits,omitempty"`
+		Error          string          `json:"error,omitempty"`
 	}
 	var out []acctCredits
 	for _, f := range files {
@@ -311,7 +315,7 @@ func handleCreditsQuery(req pluginapi.ManagementRequest) map[string]any {
 			continue
 		}
 		cr, err := fetchUserResource(sa)
-		ac := acctCredits{AuthIndex: f.AuthIndex, Nickname: sa.Account.Nickname, UID: sa.Account.UID}
+		ac := acctCredits{AuthIndex: f.AuthIndex, Nickname: sa.Account.Nickname, UID: sa.Account.UID, IdentityFamily: identityFamilyFor(sa)}
 		if err != nil {
 			ac.Error = err.Error()
 		} else {

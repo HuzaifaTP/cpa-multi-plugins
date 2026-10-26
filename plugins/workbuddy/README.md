@@ -31,6 +31,21 @@ Absent fields inherit the global; `0` explicitly disables that guardrail for thi
 
 **Scope limitation (by design):** the skip only bites when the plugin is doing the picking (`scheduler_mode: credits`). In host-side pick modes the guardrail cannot intervene — the host never asks the plugin for candidates. When every workbuddy candidate is guarded, the pick defers to the host like any empty-candidate case, with a log line.
 
+## Outbound-identity lane switch (opt-in, #59)
+
+On a 429, the plugin cools the (credential, model) pair and the host rotates to another auth — the identity family the credential speaks (CLI vs adopted-IDE) never changes. For 1–2-account deployments that want to drain **every quota lane** on the account they have, this knob treats the two families' quota lanes as separate lines and flips the credential's family after an account-level 429, so its next requests speak the other lane:
+
+```yaml
+identity_switch_on_429: true   # default false
+```
+
+- **Sticky and persisted**: the flip writes `identity_family` into the credential record — a restart must not forget which lane is hot; a fresh re-login resets to the login family. Never per-request.
+- **Order CLI → IDE → CLI, capped at 4 flips per credential per UTC+8 day** to bound oscillation.
+- **Whole-family, atomically**: CLI family = WorkBuddy X-IDE trio + OpenAI-SDK `X-Stainless-*` set; IDE family = CodeBuddyIDE trio, no Stainless. A switch swaps the whole correlated set, never mixes (the v0.9.69 invariant).
+- **Scope: CN-realm credentials only** — Intl owns its header family outright and Global's proven working shape is the desktop/CLI family; field reports decide any widening.
+- **Trigger: the account-level 429 family only** — model-scoped 6004 rejections (keyed (credential, model) with their own reset windows) never flip the lane.
+- Every switch logs the old → new family and today's budget; the credits panel always names the credential's current `identity_family`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

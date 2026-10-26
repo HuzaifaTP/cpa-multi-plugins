@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.75
+
+### Opt-in 429-triggered outbound-identity lane switch (issue #59)
+
+Implements the design as answered by the maintainer (2026-10-25): the outbound identity family (CLI vs adopted-IDE) is fixed at login time per credential, and on a 429 the plugin cools the (credential, model) pair — this adds the opt-in lane switch that treats the two families' quota lanes as separate lines and flips the credential's family after an account-level 429, so its NEXT requests speak the other lane.
+
+- **`identity_switch_on_429: true`** (default **false**) — the value concentrates in 1–2-account deployments that want to drain every quota lane on the account they have; multi-account pools already have the right ceiling (cool the pair, host rotates).
+- **Sticky, credential-level, persisted**: the flip writes `identity_family` into the auth record through the standard persistAuthTokens merge — a restart must not forget which lane is hot; a fresh login resets to the login family. Per-request switching is rejected by design (it would make the effective cooldown key (credential, model, family) and turn debugging into archaeology). Without a host authIndex there is nowhere to persist — no persist means no switch (never a half-switch riding a snapshot).
+- **Switch order CLI → IDE → CLI, capped at 4/day per credential** (hub's MAX_PRODUCT_SWITCHES=4 parity, day-scoped on the UTC+8 metering day, same day-key machinery as the #61 guardrails) to bound oscillation.
+- **Whole-family switch, atomically**: `backendHeaders` now keys both the X-IDE family selection and the Stainless gate on the effective family — a CLI-login credential flipped to ide speaks the CodeBuddyIDE set and drops X-Stainless-*; an IDE-login credential flipped to cli gains the WorkBuddy trio plus Stainless. The families stay internally coherent, never mixed (the v0.9.69 invariant).
+- **Scope: CN-realm credentials only** — both families are field-proven on the CN gateway; Intl owns its header family outright (applyRealmHeaders), and Global's proven working shape is the desktop/CLI family (#43/#44/#45 gates). Field reports decide any widening.
+- **Trigger surface**: the account-level 429 family only (the same branch that marks the pair rate-limit-cooled). Model-scoped 6004 rejections never flip the lane — they are keyed (credential, model) and own their precise reset windows.
+- **Observability**: every switch logs old → new with today's budget; the cap logs once when reached; the credits panel (single-account row and list rows) now always names the credential's current `identity_family`.
+- Hermetic coverage: 10 tests in `identity_switch_test.go` (default-off, CLI→IDE, IDE→CLI, daily cap + day rollover, realm scope, no-authIndex, header coherence both directions, sticky-survives-refresh-merge, 6004 not a trigger, config knob). Full `-race` suite green.
+
 ## 0.9.74
 
 ### The retry ladder's transient classifier derives from conn-level (single source of truth)

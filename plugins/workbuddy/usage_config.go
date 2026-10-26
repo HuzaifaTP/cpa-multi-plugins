@@ -122,6 +122,7 @@ func configure(raw []byte) {
 	nextAccountMaxConcurrent := 0   // default off: admission control disabled
 	nextReserveCredits := int64(0)  // default off: guardrail disabled (#61)
 	nextDailyCreditsCap := int64(0) // default off: guardrail disabled (#61)
+	nextIdentitySwitchOn := false   // default off: 429 lane switch disabled (#59)
 
 	nextPinned := map[string][]string{}
 	cfgURL, cfgKey := "", ""
@@ -191,6 +192,9 @@ func configure(raw []byte) {
 					if n, err := strconv.ParseInt(configScalarString(v), 10, 64); err == nil && n > 0 {
 						nextDailyCreditsCap = n
 					}
+				}
+				if v, present := m["identity_switch_on_429"]; present {
+					nextIdentitySwitchOn = configScalarBool(v)
 				}
 			}
 			for _, line := range strings.Split(string(req.ConfigYAML), "\n") {
@@ -278,6 +282,11 @@ func configure(raw []byte) {
 					if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
 						nextDailyCreditsCap = n
 					}
+				}
+				if strings.HasPrefix(line, "identity_switch_on_429:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "identity_switch_on_429:"))
+					v = strings.Trim(v, "\"'")
+					nextIdentitySwitchOn = v == "true" || v == "1" || v == "yes" || v == "on"
 				}
 				if strings.HasPrefix(line, "models_cn:") {
 					if ids := parsePinnedModelList(strings.TrimPrefix(line, "models_cn:")); len(ids) > 0 {
@@ -381,6 +390,17 @@ func configure(raw []byte) {
 	}
 	dailyCreditsCap = nextDailyCreditsCap
 	dailyCreditsCapMu.Unlock()
+
+	identitySwitchMu.Lock()
+	if identitySwitchOn != nextIdentitySwitchOn {
+		if nextIdentitySwitchOn {
+			log.Printf("workbuddy: identity_switch_on_429 applied (sticky outbound-family lane switch on account-level 429, CN realm, %d/day per credential) (#59)", identitySwitchDailyCap)
+		} else {
+			log.Printf("workbuddy: identity_switch_on_429 disabled")
+		}
+	}
+	identitySwitchOn = nextIdentitySwitchOn
+	identitySwitchMu.Unlock()
 
 	// management key: config_yaml > env > keep existing. Empty stays empty
 	// (plugin-layer auth disabled, host middleware still guards).

@@ -314,6 +314,11 @@ func recordUpstreamFailure(authID string, sa *storedAuth, model string, status i
 	}
 	if status == http.StatusTooManyRequests || isSoftRateLimit(status, body) {
 		markModelCooldown(authID, model, cooldownReasonRateLimit)
+		// #59: the account-level 429 family is also the opt-in quota-lane
+		// switch trigger — sticky, persisted, CN-realm only, capped per day.
+		// 6004 (model-scoped) returned early above and never reaches here; a
+		// model-scoped limit must not flip an account-scoped lane.
+		maybeSwitchIdentityFamily(authID, sa)
 		return
 	}
 	// Daily-allowance wording (issue #35 supplementary tier, v0.9.58): the

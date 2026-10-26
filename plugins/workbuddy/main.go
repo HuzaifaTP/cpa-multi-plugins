@@ -351,7 +351,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.9.74"
+var version = "0.9.75"
 
 func wbRegistration() registration {
 	return registration{
@@ -488,6 +488,12 @@ type storedTokens struct {
 	// (workbuddy login) or "ide" (CodeBuddy IDE login). Empty means legacy
 	// CLI-style (no X-IDE-* headers), matching historical workbuddy files.
 	LoginPlatform string `json:"loginPlatform,omitempty"`
+	// IdentityFamily is the sticky outbound-family state for the CHAT plane
+	// (#59): "cli" or "ide" — the quota lane the credential currently
+	// speaks, flipped only by the opt-in 429 lane switch and persisted through
+	// every persistAuthTokens merge (a restart must not forget which lane is
+	// hot). Empty = inherit the login family; a fresh login resets it.
+	IdentityFamily string `json:"identity_family,omitempty"`
 	// Region records which realm produced the token: "cn" (copilot.tencent.com),
 	// "intl" (codebuddy.ai IDE client) or "global" (workbuddy.ai panel import).
 	// Empty = legacy file — accountRegion falls back to domain sniffing.
@@ -631,7 +637,14 @@ func endpointModelsFor(sa *storedAuth) string {
 // Empty fields are signalled via the X-No-* convention used by CodeBuddy.
 func backendHeaders(req *http.Request, sa *storedAuth) {
 	commonHeaders(req)
-	applyPlatformHeaders(req, platformForAuth(sa))
+	// #59: the chat plane follows the sticky outbound family (identity_family),
+	// not the raw login platform — both the X-IDE family selection and the
+	// Stainless gate below key on familyPlatformFor, so a lane switch is a
+	// whole-family change: CLI Stainless set out, CodeBuddyIDE set in (or
+	// back), atomically, never mixed. Login/refresh/billing planes keep the
+	// login-family shape; Intl's applyRealmHeaders still runs after this and
+	// still owns the Intl family (switching is CN-realm only anyway).
+	applyPlatformHeaders(req, familyPlatformFor(sa))
 	applyRealmHeaders(req, sa)
 	// v0.9.29 (fork libo0118/qoder-custom review): the official WorkBuddy
 	// 5.5.6 desktop's bundled CLI sends these identity headers on chat calls;
@@ -648,7 +661,10 @@ func backendHeaders(req *http.Request, sa *storedAuth) {
 	// fingerprint family the official CLI's bundled SDK sends on chat
 	// calls (6.25.0 shape, real OS/arch). IDE-identity logins keep their
 	// own CodeBuddyIDE family — mixing the two would be a new mismatch.
-	if !isIDEPlatform(platformForAuth(sa)) {
+	// #59: this now keys on the effective family, so a switched-to-IDE
+	// credential drops the Stainless set and a switched-to-CLI credential
+	// gains it, whole-family either way.
+	if !isIDEPlatform(familyPlatformFor(sa)) {
 		applyStainlessHeaders(req)
 	}
 	// 2026-10-19 (PR #43): the Global realm's gateway rejects otherwise-valid
