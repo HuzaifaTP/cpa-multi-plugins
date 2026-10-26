@@ -402,8 +402,13 @@ func buildQoderBody(req *openAIRequest, modelKey, userType string) ([]byte, erro
 	base["messages"] = outMsgs
 
 	// Client tools win; template tools only ride along in template mode.
+	// v0.8.69 (magpie qoder 0.2.35, #378): mended on a decoded copy first —
+	// kmodel (Kimi K3.1 Pro) 502s a chat whose tools hold an untyped oneOf
+	// even of objects only (dsh's REA tools), and takes the same body with
+	// type:object beside each such oneOf (real dsh run). The caller's raw
+	// payload is never touched.
 	if len(req.Tools) > 0 && string(req.Tools) != "null" {
-		base["tools"] = req.Tools
+		base["tools"] = mendToolSchemasRaw(req.Tools)
 	}
 
 	// business
