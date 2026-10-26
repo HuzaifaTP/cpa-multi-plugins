@@ -112,11 +112,21 @@ func TestTranslateChatUpstreamErrorFullShapes(t *testing.T) {
 		t.Errorf("WAF copy must name WAF+403: %s", msg)
 	}
 
-	// Business 403 keeps the raw shape.
+	// Business 403 without a dedicated translation keeps the raw shape
+	// (v0.9.73 moved 11140 to its own copy, so 11133 is the plain case now).
 	err = translateChatUpstreamErrorFull(http.StatusForbidden,
-		`{"code":11140,"msg":"request illegal"}`, sa, nil)
+		`{"code":11133,"msg":"Invalid request parameters"}`, sa, nil)
 	if !strings.Contains(err.Error(), "upstream 403") {
 		t.Errorf("business 403 keeps raw shape: %s", err.Error())
+	}
+
+	// 403+11140 (account restriction, v0.9.73) gets the dedicated bilingual
+	// copy with the actionable guidance — not the bare raw shape.
+	err = translateChatUpstreamErrorFull(http.StatusForbidden,
+		`{"code":11140,"msg":"request illegal","displayMsg":{"en":"Your account has been restricted due to unusual activity","zh":"账号存在异常行为"}}`, sa, nil)
+	msg = err.Error()
+	if !strings.Contains(msg, "11140") || !strings.Contains(msg, "account_max_concurrent") || !strings.Contains(msg, "raw:") {
+		t.Errorf("11140 restriction copy must name the code, the parallel-request advice and keep raw: %s", msg)
 	}
 
 	// 11102 keeps its dedicated translation (priority over newer shapes).

@@ -418,6 +418,16 @@ func translateChatUpstreamErrorFull(statusCode int, payload string, sa *storedAu
 			"提示词过长（%s）——上下文超出模型上限，属于请求本身的问题，与账号无关；请缩短上下文/清理会话或开新会话后重试。"+
 				" // Prompt too long for the model's context window (request-level, not account-level); shrink the context or start a new session. | raw: %s",
 			detail, truncateRedacted(payload, 200))
+	case isAccountRestricted(statusCode, payload):
+		// v0.9.73: 403+11140 is an account-level restriction — the display
+		// copy says "restricted due to unusual activity". The raw shape
+		// starts with "upstream 403", which hosts re-read as a generic
+		// permission failure; the dedicated copy names the code, the
+		// known triggers, and the auto-quarantine (account_restriction.go).
+		return fmt.Errorf(
+			"上游账号风控限制（code 11140 账号存在异常行为）——该账号已被上游限制，插件无法解除；已知诱因：并发请求（建议开启 account_max_concurrent: 1）或新账号立即大流量；请在官方客户端确认账号状态或申诉，恢复后自动重新启用，期间该账号已被自动隔离。"+
+				" // Upstream account restriction (code 11140, unusual activity) — restricted by WorkBuddy upstream and the plugin cannot lift it; known triggers: parallel requests (consider account_max_concurrent: 1) or heavy traffic right after signup. Check the account in the official client or appeal; it re-enters rotation automatically once healthy, and is quarantined until then. | raw: %s",
+			truncateRedacted(payload, 200))
 	case isChannelRiskControl(statusCode, payload):
 		return fmt.Errorf(
 			"上游渠道风控（code 11128）——通常由请求特征或频率触发，与账号状态无关；请降低请求频率稍后再试，持续出现请更新插件以对齐官方客户端请求特征。"+

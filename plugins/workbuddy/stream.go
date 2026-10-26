@@ -246,6 +246,9 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 		errPayload, _ := io.ReadAll(newHostStreamReader(stream))
 		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(errPayload))
 		noteModelRateLimitFromPayload(authUID, upstreamModel, statusCode, string(errPayload))
+		// v0.9.73: 403+11140 quarantines the credential (account restricted
+		// upstream) on the async path too.
+		noteAccountRestrictionFromPayload(authID, sa, statusCode, string(errPayload))
 		// issue #35: >=400 failures also feed the per-(credential, model)
 		// cooldown table (6004 was just noted into its own registry; the
 		// classifier here defers to it, see cooldown.go).
@@ -295,6 +298,8 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 	// v0.9.25: learn the real model behind a tier alias from the response
 	// echo (Intl only — no-op for every other id).
 	noteLearnedRealModel(upstreamModel, collector.respModel)
+	// v0.9.73: healthy answer clears restriction state (self-heal, async path).
+	noteAccountHealthy(authID, sa)
 	invalidateAccountCredits(authID, authUID)
 }
 

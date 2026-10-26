@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.73
+
+### Account-restriction quarantine for 403+11140 (field report 2026-10-26)
+
+Field report: a freshly initialized account answered every chat request with HTTP 403 `code=11140` "request illegal" / displayMsg "Your account has been restricted due to unusual activity"（账号存在异常行为）, wrapped as 500 by the host after retries. This is the upstream restricting the ACCOUNT — distinct from the bare-403 WAF shape (no envelope), the 11128 channel risk control (request-shaped), and credit exhaustion (credits can read healthy while chat refuses the account). The restriction itself only WorkBuddy/Tencent support can lift; the field-confirmed trigger family is unusual request patterns — most notably PARALLEL requests (magpie-community/plugins#339: an account restricted after two harnesses fired it concurrently survived on a fresh account once the parallelism stopped).
+
+- New `account_restriction.go`: the 403+11140 classifier (JSON envelope first, substring fallback), an in-memory per-credential quarantine registry with an escalating ladder (first strike 1h → 2h → 4h → 8h cap), and a bilingual fast-fail copy. A healthy answer clears the entry on every executor success path, so a restriction lifted upstream self-heals without operator action.
+- Wiring: all four chat executor paths note the restriction on >=400 (sync, stream-sync collector, async pump) and clear on success; both executors fast-fail quarantined credentials (plain error, no StatusCode — the host rotates, never reads it as quota); `handleSchedulerPick` skips quarantined candidates with an all-quarantined WARN defer.
+- `translateChatUpstreamErrorFull` gives 11140 its own bilingual, actionable copy (names the code, the known triggers incl. the `account_max_concurrent: 1` advice for parallel-request prevention, the appeal path via the official client, and the auto-quarantine) instead of the bare `upstream 403: {json}`.
+- The host-side `statusError{403}` credential cooldown is unchanged — the quarantine adds the longer plugin-side hold on top, the same two-layer shape as the 6004 model-scoped registry.
+
 ## 0.9.72
 
 ### Tool compaction covers the Responses-API tool shapes (issue #63)

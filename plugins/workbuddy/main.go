@@ -351,7 +351,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.9.72"
+var version = "0.9.73"
 
 func wbRegistration() registration {
 	return registration{
@@ -888,6 +888,13 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	// failed upstream (in-stream quota frame, empty stream, 429 family) fails
 	// here without an upstream call so the host rotates to another candidate
 	// instead of re-hammering the drained pair.
+	// v0.9.73: account-restriction fast-fail — a credential quarantined by
+	// 403+11140 (account restricted upstream) fails here without an upstream
+	// call, so the host rotates instead of re-hammering a flagged account.
+	if err := accountRestrictionError(req.AuthID, sa); err != nil {
+		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
+		return nil, err
+	}
 	if err := modelCooldownError(req.AuthID, sa, upstreamModel); err != nil {
 		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
 		return nil, err
@@ -924,6 +931,10 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		payload, _ := io.ReadAll(reader)
 		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(payload))
 		noteModelRateLimitFromPayload(authUID, upstreamModel, statusCode, string(payload))
+		// v0.9.73: 403+11140 quarantines the credential (account restricted
+		// upstream) — the pick filter and executor fast-fail hold it out of
+		// rotation until the backoff window lapses or a healthy answer clears it.
+		noteAccountRestrictionFromPayload(req.AuthID, sa, statusCode, string(payload))
 		// Issue #35: >=400 failures feed the per-(credential, model) cooldown
 		// table (6004 keeps its own registry — the classifier defers to it).
 		noteModelCooldownFailure(req.AuthID, sa, upstreamModel, statusCode, string(payload))
@@ -946,6 +957,9 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	publishUsage(req.Model, upstreamModel, authUID, started, usageDetailFromCompletion(completion), false, 0, "")
 	// v0.9.25: learn the real model behind a tier alias from the response echo.
 	noteLearnedRealModel(upstreamModel, modelFromCompletionPayload(completion))
+	// v0.9.73: a normal answer clears any restriction state — a restriction
+	// lifted upstream self-heals the credential without operator action.
+	noteAccountHealthy(req.AuthID, sa)
 	invalidateAccountCredits(req.AuthID, authUID)
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
 }
@@ -978,6 +992,12 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	// Other (credential, model) pairs are untouched; the error stays
 	// plain so no host version reads it as credential-level quota.
 	if err := modelRateLimitError(authUID, upstreamModel); err != nil {
+		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
+		return nil, err
+	}
+	// v0.9.73: account-restriction fast-fail (same contract as the non-stream
+	// path — quarantined credentials never reach the upstream).
+	if err := accountRestrictionError(req.AuthID, sa); err != nil {
 		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
 		return nil, err
 	}
@@ -1015,10 +1035,15 @@ func handleExecStream(raw []byte) ([]byte, error) {
 			// empty streams and >=400s as its error — feed the pair
 			// cooldown so the NEXT request rotates candidates.
 			noteModelCooldownFailure(req.AuthID, sa, upstreamModel, statusCode, errCollect.Error())
+			// v0.9.73: a >=400 collected here may be the 11140 restriction —
+			// feed the quarantine registry too (no-op for anything else).
+			noteAccountRestrictionFromPayload(req.AuthID, sa, statusCode, errCollect.Error())
 			return nil, errCollect
 		}
 		publishUsage(req.Model, upstreamModel, authUID, started, collector.detail(), false, 0, "")
 		noteLearnedRealModel(upstreamModel, collector.respModel)
+		// v0.9.73: healthy answer clears restriction state (self-heal).
+		noteAccountHealthy(req.AuthID, sa)
 		invalidateAccountCredits(req.AuthID, authUID)
 		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
 	}
