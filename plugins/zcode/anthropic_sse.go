@@ -515,8 +515,27 @@ func startPlanBizError(status int, body string, captchaHeader string) error {
 	if startPlanCaptchaChallenge(status, captchaHeader, body) {
 		return fmt.Errorf("start-plan 网关要求验证码挑战 (3007)：本插件未内置求解器，请稍后重试或改用 coding-plan 账号 — upstream %d: %s", status, truncateRedacted(body, 200))
 	}
+	// v0.2.5 (magpie zcode 0.1.27, #348): an HTML / errors.aliyun.com block
+	// page is the EDGE FIREWALL blocking this network's address — a network
+	// problem, never the account's. Checked before the code switch so the
+	// page's wording never masquerades as a business code.
+	if isZcodeEdgeBlockPage(body) {
+		return fmt.Errorf("ZCode 边缘防火墙拦截了本网络地址（block page）：换网络/代理可恢复，与账号无关 — upstream %d: %s // ZCode's edge firewall blocked this network's address: switch network or proxy; the account is not the problem", status, truncateRedacted(body, 200))
+	}
 	code := extractBizErrorCode(body)
 	switch code {
+	case "3012":
+		// v0.2.5 (magpie zcode 0.1.27, #348): since 2026-10-24 zcode.z.ai
+		// answers 405 + {"code":3012,"msg":"request has been blocked due to
+		// unusual activity"} to EVERY request of an account its platform risk
+		// control blocked — ZCode's own desktop app (3.16.3) gets the same 405;
+		// ZCode's support bot calls it "3012 platform risk control on the
+		// account". This is the ACCOUNT being restricted, not a network block
+		// and not the 0.2.2 content-filter shape (the sanitizer already keeps
+		// the system field clean). Say ZCode's words with the status and code,
+		// then the actionable truth: the credential rests, the pool's other
+		// credentials serve, only ZCode support lifts it.
+		return fmt.Errorf("ZCode 风控封锁了该账号 (405, code 3012, \"request has been blocked due to unusual activity\")：平台风控按“异常行为模式”封号，ZCode 官方客户端同样 405（2026-10-24 起多账号全量复现）；该凭据暂停使用，池内其他凭据继续服务，仅 ZCode 官方支持可解除 — upstream %d: %s // ZCode's risk control blocked this account for unusual activity (code 3012): the credential rests, the pool's other credentials serve, and only ZCode support lifts it", status, truncateRedacted(body, 200))
 	case "1261":
 		return fmt.Errorf("输入超出模型上下文窗口 (1261)：请压缩上下文/清理会话后重试 — upstream %d: %s", status, truncateRedacted(body, 200))
 	case "1006":
@@ -531,6 +550,19 @@ func startPlanBizError(status int, body string, captchaHeader string) error {
 		return fmt.Errorf("请求被上游拒绝 (%s)：请求参数或模型不可用 — upstream %d: %s", code, status, truncateRedacted(body, 200))
 	}
 	return chatUpstreamError(status, body)
+}
+
+// isZcodeEdgeBlockPage reports whether body is ZCode's edge-firewall block
+// page (an HTML / errors.aliyun.com answer), not a JSON business-code answer
+// — magpie zcode 0.1.27's EDGE_BLOCKED with JSON excluded, because the 3012
+// JSON answer is the ACCOUNT restriction and owns its own copy above.
+func isZcodeEdgeBlockPage(body string) bool {
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" || strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	low := strings.ToLower(body)
+	return strings.Contains(low, "errors.aliyun.com") || strings.Contains(low, "request has been blocked")
 }
 
 // timeNowUnix is the created-timestamp source for translated chunks

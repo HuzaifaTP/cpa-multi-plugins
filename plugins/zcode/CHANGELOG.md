@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.5
+
+### 405 code 3012 says ZCode's risk control blocked the account (magpie zcode 0.1.27, #348)
+
+Absorbed from magpie-community/plugins `28f9cbb` (zcode 0.1.27, 2026-10-24): since 2026-10-24 zcode.z.ai answers 405 `{"code":3012,"msg":"request has been blocked due to unusual activity."}` to **every** request of an account its platform risk control blocked — ZCode's own desktop app (3.16.3) gets the same 405, and ZCode's support bot calls it "3012 platform risk control on the account". The old generic rendering (and magpie's old copy) let it read as a network block of the IP.
+
+- `startPlanBizError` now owns the classification: the 3012 JSON gets a bilingual **account-restriction** copy — ZCode's own words with the status and code, then the actionable truth: the credential rests, the pool's other credentials serve, and only ZCode support lifts it. Distinct from the 0.2.2 content-filter shape (the sanitizer already keeps the system field clean) and from the 401 re-login family.
+- New `isZcodeEdgeBlockPage` (checked before the code switch): an HTML / `errors.aliyun.com` block page is the **edge firewall blocking this network's address** — a network problem with its own copy; a JSON body is never the page, so the same wording inside the 3012 JSON stays the account's.
+- Tests: `TestStartPlanBizErrorMessages` pins the 3012 restriction copy (ZCode's words + code + not-network), the HTML page's edge-firewall copy, and the JSON-never-page rule.
+
 ## 0.2.4
 
 ### Start Plan rides ZCode 3.16.3's exact request shape (magpie packages/zcode 0.1.22)

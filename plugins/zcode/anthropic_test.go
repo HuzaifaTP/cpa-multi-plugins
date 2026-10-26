@@ -835,6 +835,28 @@ func TestStartPlanBizErrorMessages(t *testing.T) {
 	if err := startPlanBizError(500, `{"code":99999}`, ""); err == nil || strings.Contains(err.Error(), "验证码") {
 		t.Fatalf("generic error = %v", err)
 	}
+	// v0.2.5 (magpie zcode 0.1.27, #348): the 405 + 3012 JSON is ZCode's
+	// platform RISK CONTROL blocking the ACCOUNT — the copy must name the
+	// restriction, ZCode's own words, and that only support lifts it; it
+	// must NOT read as a network block.
+	err := startPlanBizError(405, `{"code":3012,"msg":"request has been blocked due to unusual activity."}`, "")
+	if err == nil || !strings.Contains(err.Error(), "风控封锁了该账号") || !strings.Contains(err.Error(), "3012") || !strings.Contains(err.Error(), "request has been blocked due to unusual activity") {
+		t.Fatalf("3012 account-restriction error = %v", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "网络") && strings.Contains(err.Error(), "防火墙") {
+		t.Fatalf("3012 JSON must not read as the edge-firewall network block: %v", err)
+	}
+	// The HTML / errors.aliyun.com block page is the NETWORK's address —
+	// the edge-firewall copy, never the account restriction copy.
+	err = startPlanBizError(405, `<html><body>request has been blocked. <a href="https://errors.aliyun.com">errors.aliyun.com</a></body></html>`, "")
+	if err == nil || !strings.Contains(err.Error(), "边缘防火墙") || strings.Contains(err.Error(), "风控封锁了该账号") {
+		t.Fatalf("edge block page error = %v", err)
+	}
+	// A JSON body with the same wording as the page still reads as JSON —
+	// the account restriction family owns it.
+	if isZcodeEdgeBlockPage(`{"code":3012,"msg":"request has been blocked due to unusual activity."}`) {
+		t.Fatal("a JSON body is never the edge block page")
+	}
 }
 
 func TestRouteChatErrorStartPlan401(t *testing.T) {
