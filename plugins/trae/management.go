@@ -740,7 +740,7 @@ func handleManualCheckin(req pluginapi.ManagementRequest) map[string]any {
 		beforeCredits := status.Credits
 		awarded := int64(-1)
 		claimAccepted := false // v0.12.61: claim 返回 code:0（含幂等回声）→ 上游接受了本次领取
-		if !status.CheckedIn && !status.DidCheckedIn && status.Enable {
+		if upstream.ClaimGate(status.CheckedIn || status.DidCheckedIn, status.Enable, upstream.ClaimSentToday(sa.Account.UID)) {
 			claim, err := upstreamClient.CheckinClaim(a, did)
 			if err != nil {
 				entry["error"] = "checkin_claim: " + err.Error()
@@ -755,6 +755,12 @@ func handleManualCheckin(req pluginapi.ManagementRequest) map[string]any {
 				}
 			} else {
 				claimAccepted = claim.Code == 0
+				// v0.12.81: claim code:0 = 上游已接受本次领取 —— 当日登记，后续手动/自动
+				// 只回读状态，绝不重发 claim（magpie trae 0.2.22：回查即当日答案；
+				// 同日多次领取正是上游风控的“异常行为模式”家族，workbuddy 403+11140 实证）。
+				if claimAccepted {
+					upstream.NoteClaimSent(sa.Account.UID)
+				}
 				entry["claim_code"] = claim.Code
 				entry["claim_message"] = claim.Message
 				// 入账证据：claim 响应携带的数额优先。
@@ -770,11 +776,16 @@ func handleManualCheckin(req pluginapi.ManagementRequest) map[string]any {
 					status = after
 					// v0.12.65: code:0 存在幂等假成功（当日已签账号任何 device_id 都回 code:0），
 					// checked_in 未翻转 -> 标记未确认，面板如实展示，不伪装成功。
+					// v0.12.81: 未确认不再触发当日重领——claim 已被接受，回查即当日答案
+					// （magpie trae 0.2.22；重按面板只回读状态）。
 					if !after.CheckedIn && !after.DidCheckedIn {
 						entry["claim_unconfirmed"] = true
 					}
 				}
 			}
+		} else if !status.CheckedIn && !status.DidCheckedIn && status.Enable && upstream.ClaimSentToday(sa.Account.UID) {
+			// v0.12.81: 今日已领（code:0 已接受）—— 手动重按只回读状态，绝不重发 claim。
+			entry["claim_skipped"] = "claim already answered code:0 today — status re-read only, not claimed again today (magpie trae 0.2.22)"
 		}
 		entry["already_checked_in"] = status.CheckedIn || status.DidCheckedIn
 		entry["credits"] = status.Credits

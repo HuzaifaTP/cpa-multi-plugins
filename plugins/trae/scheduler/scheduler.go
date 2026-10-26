@@ -153,6 +153,11 @@ func (s *Scheduler) RunCheckinNow() {
 		// v0.12.73: 账号稳定签到设备号（upstream.CheckinDeviceFor —— 与绑定续期
 		// DeviceInfo 同一身份；9074 根因是 token 未绑设备而非设备号形状），
 		// 持续 9074 时由 rotateCheckinDevice 轮换（trae-checkin 模型）。
+		// v0.12.81 (magpie trae 0.2.22 纪律吸收): claim code:0 即“上游已接受本次领取”——
+		// 回查未确认/回查失败不再纳入当日重试（旧逻辑会在退避后再次 claim，
+		// 同日多次领取正是上游风控的“异常行为模式”家族，workbuddy 403+11140 实证）；
+		// 已领（code:0）账号当日后续轮次只回读状态，绝不重发 claim。
+		// 9074 拒绝仍保留当日退避重试（服务器拒绝入账，未发生领取；轮换设备实证可领）。
 		did := upstream.CheckinDeviceFor(a)
 		status, err := s.cfg.Upstream.CheckinStatus(a, did)
 		if err != nil {
@@ -163,7 +168,18 @@ func (s *Scheduler) RunCheckinNow() {
 				log.Printf("checkin status %s: %v", st.UID, err)
 			}
 			status = nil
-		} else if !status.CheckedIn && !status.DidCheckedIn && status.Enable {
+		} else if !upstream.ClaimGate(status.CheckedIn || status.DidCheckedIn, status.Enable, upstream.ClaimSentToday(st.UID)) {
+			// v0.12.81 (magpie trae 0.2.22 纪律吸收): 门控说本轮不 claim —— 已签/未启用
+			// 只回读；已领（code:0 已接受）当日绝不重发 claim（回查即当日答案；
+			// 同日多次领取正是上游风控的"异常行为模式"家族，workbuddy 403+11140 实证）。
+			if status.CheckedIn || status.DidCheckedIn {
+				log.Printf("checkin %s: already checked in (reward %d)", st.UID, status.Credits)
+			} else if !status.Enable {
+				// 对齐原链路：未启用保持静默，不产生噪音。
+			} else if upstream.ClaimSentToday(st.UID) {
+				log.Printf("checkin %s: claim already answered code:0 today — status re-read only, not claimed again today (magpie trae 0.2.22)", st.UID)
+			}
+		} else {
 			// v0.12.32: 官方 claim 需要 x-device-id；缺失时服务端可能
 			// code=0 但静默不入账（FINDINGS §四/§五）。v0.12.43 曾对无
 			// deviceId 账号硬性跳过 claim；v0.12.65 起设备号改为每轮全新
@@ -178,6 +194,8 @@ func (s *Scheduler) RunCheckinNow() {
 					log.Printf("checkin claim %s: %v", st.UID, err)
 				}
 			} else {
+				// v0.12.81: claim code:0 = 上游已接受本次领取 —— 当日登记，不再重发。
+				upstream.NoteClaimSent(st.UID)
 				// v0.12.40: credits 语义修正——status.credits 是"签到可领奖励"
 				// （官方卡片 "Daily check-in: {credits} credits"），签到后不会增长，
 				// 旧的"签到后-签到前"差值算法作废。入账证据优先取 claim 响应
@@ -192,18 +210,19 @@ func (s *Scheduler) RunCheckinNow() {
 				after, stErr := s.cfg.Upstream.CheckinStatus(a, did)
 				switch {
 				case stErr != nil:
-					log.Printf("checkin %s: claimed +%d, recheck failed: %v — will retry today", st.UID, awarded, stErr)
-					rateLimited++
+					// v0.12.81: 回查失败 ≠ 领取失败——claim 已被接受，当日不重试
+					// （magpie 0.2.22：回读不到只说明"未知"，不是重发 claim 的理由）。
+					log.Printf("checkin %s: claimed +%d, recheck failed: %v — claim stands, status re-read only for the rest of the day (magpie trae 0.2.22)", st.UID, awarded, stErr)
 				case after.CheckedIn || after.DidCheckedIn:
 					log.Printf("checkin %s: ok +%d (credits=%d extra=%d, take-one v0.12.80)", st.UID, awarded, status.Credits, status.ExtraCredits)
 					status = after
 				default:
-					log.Printf("checkin %s: claim code=0 but recheck did not confirm check-in (credits %d -> %d) — will retry today", st.UID, status.Credits, after.Credits)
-					rateLimited++
+					// v0.12.61→v0.12.81 语义修订：code:0 + 回查未确认——"已领取待上游入账/幂等回声"，
+					// 当日不再重试重发（旧逻辑 rateLimited++ 会在退避后再次 claim；同日多次领取
+					// 正是上游风控的异常行为模式家族，workbuddy 403+11140 实证；magpie 0.2.22 同判）。
+					log.Printf("checkin %s: claim answered code:0 but recheck did not confirm (credits %d -> %d) — claim stands for today, not claimed again today (magpie trae 0.2.22)", st.UID, status.Credits, after.Credits)
 				}
 			}
-		} else if status.CheckedIn || status.DidCheckedIn {
-			log.Printf("checkin %s: already checked in (reward %d)", st.UID, status.Credits)
 		}
 		// 查积分 + 解冻
 		// 对齐 cockpit-tools apply_usage_response：按 pack 优先级选最高 pack。
