@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.76
+
+### oneOf of objects with no type gets type:object — Kimi 400 fix (magpie workbuddy 0.1.33, #378)
+
+Absorbed from magpie-community/plugins `def6a83` (workbuddy 0.1.33, 2026-10-25): kimi-k3.1-pro on workbuddy and workbuddy-ai answers 400 `Invalid request parameters` to a tool whose parameters hold a oneOf with no type — even when every branch is an object, directly or through a chain of local $refs (dsh's REA tools). The same request with `"type": "object"` beside the oneOf gets 200, verified in three real dsh runs with all 198 tools.
+
+- New `payload.go` pipeline step 3.3 (`typeUnionToolSchemas`): walks `tools` in all three shapes (the 0.9.72 compaction discipline — nested `function.parameters`, flat Responses-API `parameters`, MCP-namespace sub-tools) and mends each parameters schema.
+- `schemaTypeUnions` / `typeUnionObjectBranch` / `typeUnionLocalRef` are a byte-aligned Go port of magpie's `typeUnions` / `objectBranch` / `localRef`: the union gains `type: "object"` only when EVERY branch is typed object (itself or via local `#/...` $ref chains, cycles broken, ≤16 hops); a union of other or mixed types, an anyOf, and a $ref that is missing, external or circular are left as they came; only schema keywords are walked (SUB_ONE/SUB_LIST/SUB_MAP sets — `examples`/`default` payloads never touched), depth-capped at 64.
+- Tests (`typeunion_test.go`) port the issue's literal parameters from magpie's tools.test.mjs: the minimal $ref → oneOf, the nested oneOf all routes refused, the REA $ref-branch shape, the left-alone matrix (typed sibling / mixed / anyOf / missing / external / circular / examples — asserted byte-for-byte unchanged), and the three-shape walker. Full `-race` suite green.
+
 ## 0.9.75
 
 ### Opt-in 429-triggered outbound-identity lane switch (issue #59)

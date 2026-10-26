@@ -62,6 +62,12 @@ func prepareUpstreamBody(payload, original []byte, sa *storedAuth, upstreamModel
 	// not in scope here.
 	sanitizeHistoryPhrasesInPlace(obj)
 
+	// 3.3 typeUnionToolSchemas: a oneOf of objects with no type gets
+	// type:object — kimi-k3.1-pro 400s "Invalid request parameters" on the
+	// untyped union even when every branch is an object, and takes the same
+	// body with the type beside it (magpie workbuddy 0.1.33 / #378).
+	typeUnionToolSchemas(obj)
+
 	// 3.5 injectReasoning: fold historical assistant reasoning_content into
 	// content as <thought> blocks — the upstream drops the non-standard
 	// field from multi-turn history and the model loses its own prior
@@ -359,6 +365,165 @@ func mirrorReasoningEffort(obj map[string]any) bool {
 		return true
 	}
 	return false
+}
+
+// typeUnionToolSchemaOneKeys / typeUnionToolSchemaListKeys / typeUnionToolSchemaMapKeys
+// are the schema-keyword walk sets (magpie SUB_ONE / SUB_LIST / SUB_MAP,
+// byte-aligned): only these keys are descended, so examples / default /
+// const payloads are never touched.
+var typeUnionToolSchemaOneKeys = []string{"items", "additionalItems", "unevaluatedItems", "contains", "not", "if", "then", "else", "propertyNames", "additionalProperties", "unevaluatedProperties"}
+var typeUnionToolSchemaListKeys = []string{"anyOf", "oneOf", "allOf", "prefixItems"}
+var typeUnionToolSchemaMapKeys = []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"}
+
+// typeUnionToolSchemas walks obj["tools"] in all three shapes (the 0.9.72
+// compaction discipline: nested function.parameters, flat Responses-API
+// parameters, MCP-namespace sub-tools) and mends each parameters schema with
+// schemaTypeUnions. Reports whether anything changed.
+func typeUnionToolSchemas(obj map[string]any) bool {
+	tools, ok := obj["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		return false
+	}
+	changed := false
+	var mendTool func(t any)
+	mendTool = func(t any) {
+		tool, ok := t.(map[string]any)
+		if !ok {
+			return
+		}
+		if fn, ok := tool["function"].(map[string]any); ok {
+			if ps, ok := fn["parameters"].(map[string]any); ok {
+				changed = schemaTypeUnions(ps, ps, 0) || changed
+			}
+		}
+		if ps, ok := tool["parameters"].(map[string]any); ok {
+			changed = schemaTypeUnions(ps, ps, 0) || changed
+		}
+		if subTools, ok := tool["tools"].([]any); ok {
+			for _, sub := range subTools {
+				mendTool(sub)
+			}
+		}
+	}
+	for _, t := range tools {
+		mendTool(t)
+	}
+	return changed
+}
+
+// schemaTypeUnions gives a oneOf with no sibling type the type "object"
+// when every branch is a typed object, itself or through a chain of local
+// $refs (magpie workbuddy typeUnions, workbuddy 0.1.33 / issue #378:
+// kimi-k3.1-pro answers 400 "Invalid request parameters" to such a union
+// even when every branch is an object, and takes the same request with
+// "type": "object" beside the oneOf — three real dsh runs with all 198
+// tools). A union of other or mixed types, an anyOf, and a $ref that is
+// missing, external or circular are left as they came. Only schema keywords
+// are walked. Reports whether anything changed.
+func schemaTypeUnions(s, root map[string]any, depth int) bool {
+	if s == nil || depth > 64 {
+		return false
+	}
+	changed := false
+	if _, hasType := s["type"]; !hasType {
+		if oneOf, ok := s["oneOf"].([]any); ok && len(oneOf) > 0 {
+			allObject := true
+			for _, b := range oneOf {
+				if !typeUnionObjectBranch(root, b, nil) {
+					allObject = false
+					break
+				}
+			}
+			if allObject {
+				s["type"] = "object"
+				changed = true
+			}
+		}
+	}
+	for _, k := range typeUnionToolSchemaOneKeys {
+		if sub, ok := s[k].(map[string]any); ok {
+			changed = schemaTypeUnions(sub, root, depth+1) || changed
+		}
+	}
+	for _, k := range typeUnionToolSchemaListKeys {
+		if list, ok := s[k].([]any); ok {
+			for _, v := range list {
+				if sub, ok := v.(map[string]any); ok {
+					changed = schemaTypeUnions(sub, root, depth+1) || changed
+				}
+			}
+		}
+	}
+	for _, k := range typeUnionToolSchemaMapKeys {
+		m, ok := s[k].(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, v := range m {
+			if sub, ok := v.(map[string]any); ok {
+				changed = schemaTypeUnions(sub, root, depth+1) || changed
+			}
+		}
+	}
+	return changed
+}
+
+// typeUnionObjectBranch says whether b is a typed object, itself or where its
+// local $refs lead (magpie objectBranch): a $ref seen before on the way is a
+// cycle, and not; more than 16 hops is not.
+func typeUnionObjectBranch(root map[string]any, b any, seen []string) bool {
+	branch, ok := b.(map[string]any)
+	if !ok {
+		return false
+	}
+	if t, has := branch["type"]; has {
+		s, _ := t.(string)
+		return s == "object"
+	}
+	ref, _ := branch["$ref"].(string)
+	if ref == "" || len(seen) > 16 {
+		return false
+	}
+	for _, s := range seen {
+		if s == ref {
+			return false
+		}
+	}
+	target := typeUnionLocalRef(root, ref)
+	if target == nil {
+		return false
+	}
+	next := make([]string, len(seen), len(seen)+1)
+	copy(next, seen)
+	next = append(next, ref)
+	return typeUnionObjectBranch(root, target, next)
+}
+
+// typeUnionLocalRef resolves a local "#/..." JSON pointer in root (with ~0 / ~1
+// unescaping, magpie localRef); a non-local ref or a missing target returns nil.
+func typeUnionLocalRef(root map[string]any, ref string) map[string]any {
+	if !strings.HasPrefix(ref, "#/") {
+		return nil
+	}
+	var at any = root
+	for _, seg := range strings.Split(ref[2:], "/") {
+		seg = strings.ReplaceAll(seg, "~1", "/")
+		seg = strings.ReplaceAll(seg, "~0", "~")
+		m, ok := at.(map[string]any)
+		if !ok {
+			return nil
+		}
+		next, ok := m[seg]
+		if !ok {
+			return nil
+		}
+		at = next
+	}
+	target, ok := at.(map[string]any)
+	if !ok {
+		return nil
+	}
+	return target
 }
 
 // compactToolDescriptions strips tool descriptions when the serialized tools
