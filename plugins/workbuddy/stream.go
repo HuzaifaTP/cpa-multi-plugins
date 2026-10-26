@@ -210,7 +210,7 @@ func emitChunks(sink streamSink, chunks [][]byte) error {
 // pump behaves exactly as it always has (in-band errors, no rollback). A nil
 // gate preserves the byte-for-byte pre-feature behavior, including emission
 // timing.
-func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, streamID string, sseFramed bool, requestedModel, upstreamModel, authUID string, started time.Time, authID string, sa *storedAuth, gate *streamHeadGate) {
+func pumpUpstreamStream(httpReq *http.Request, buildReq func(*storedAuth) (*http.Request, error), cancel context.CancelFunc, streamID string, sseFramed bool, requestedModel, upstreamModel, authUID string, started time.Time, authID string, sa *storedAuth, gate *streamHeadGate) {
 	// Always close the host stream exactly once on every exit path.
 	closed := false
 	closeOnce := func() {
@@ -225,42 +225,90 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 		defer cancel()
 	}
 
-	stream, statusCode, respHdr, err := hostHTTPDoStream(httpReq)
-	if err != nil {
-		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
-		// The transport-level failure carries no upstream status; surface it to
-		// the hand-off as a plain pre-answer failure (status 0) so a stalled
-		// stream that errors before answering never opens the host stream.
-		// (Deliberately NOT tabled in cooldown.go: a transport hiccup says
-		// nothing about the pair — same reasoning as policy.go's
-		// transport-lifecycle wording.)
-		if !gate.fail(fmt.Errorf("http_error: %v", err)) {
+	// v0.9.74: the request phase is a two-iteration loop — a 401 on the first
+	// attempt earns one renewal and one resend (the chat half of 0.9.68's
+	// billing-plane heal; same contract as the sync executor path, see
+	// handleExecExecute). Every other status, or a heal that cannot rescue
+	// the request, breaks out, and the failure reporting below runs on the
+	// FINAL attempt's status and payload — a healed request continues into
+	// the normal pump flow as if it had simply worked.
+	var stream *hostHTTPStream
+	var statusCode int
+	var respHdr http.Header
+	var verdict chat401Verdict
+	attempts := 0
+	for {
+		attempts++
+		req1 := httpReq
+		var err error
+		if attempts > 1 {
+			req1, err = buildReq(sa)
+		}
+		var s *hostHTTPStream
+		var code int
+		var hdr http.Header
+		if err == nil {
+			s, code, hdr, err = hostHTTPDoStream(req1)
+		}
+		if err != nil {
+			publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
+			// The transport-level failure carries no upstream status; surface it to
+			// the hand-off as a plain pre-answer failure (status 0) so a stalled
+			// stream that errors before answering never opens the host stream.
+			// (Deliberately NOT tabled in cooldown.go: a transport hiccup says
+			// nothing about the pair — same reasoning as policy.go's
+			// transport-lifecycle wording.)
+			if !gate.fail(fmt.Errorf("http_error: %v", err)) {
+				return
+			}
+			streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
 			return
 		}
-		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
-		return
+		stream, statusCode, respHdr = s, code, hdr
+		if code < 400 || attempts == 2 || code != http.StatusUnauthorized || buildReq == nil {
+			break
+		}
+		// First attempt got a 401: try the heal before reporting it. The body is
+		// rebuilt by buildReq from the same prepared bytes (the realm family
+		// cannot flip within one credential's refresh — only the auth-bearing
+		// headers and endpoint ride the fresh snapshot).
+		outcome, fresh := healChat401(authID, sa)
+		if outcome != chat401HealResend || fresh == nil {
+			if outcome == chat401SessionDead {
+				verdict.SessionDead = true
+			}
+			break
+		}
+		stream.Close() // release the bounced attempt's stream before the resend
+		sa = fresh
 	}
 	defer stream.Close()
 	if statusCode >= 400 {
 		// Drain the error body via the same bridge so the message is complete.
 		errPayload, _ := io.ReadAll(newHostStreamReader(stream))
-		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(errPayload))
-		noteModelRateLimitFromPayload(authUID, upstreamModel, statusCode, string(errPayload))
+		errText := string(errPayload)
+		if statusCode == http.StatusUnauthorized && attempts == 2 {
+			verdict.RenewedRefused = true
+		}
+		publishUsage(requestedModel, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, errText)
+		noteModelRateLimitFromPayload(authUID, upstreamModel, statusCode, errText)
 		// v0.9.73: 403+11140 quarantines the credential (account restricted
 		// upstream) on the async path too.
-		noteAccountRestrictionFromPayload(authID, sa, statusCode, string(errPayload))
+		noteAccountRestrictionFromPayload(authID, sa, statusCode, errText)
 		// issue #35: >=400 failures also feed the per-(credential, model)
 		// cooldown table (6004 was just noted into its own registry; the
 		// classifier here defers to it, see cooldown.go).
-		noteModelCooldownFailure(authID, sa, upstreamModel, statusCode, string(errPayload))
+		noteModelCooldownFailure(authID, sa, upstreamModel, statusCode, errText)
 		if authUID != "" {
-			go reconcileByUID(authUID, statusCode, string(errPayload))
+			go reconcileByUID(authUID, statusCode, errText)
 		}
-		fullErr := translateChatUpstreamErrorFull(statusCode, string(errPayload), sa, respHdr)
+		fullErr := translateChatUpstreamErrorFull(statusCode, errText, sa, respHdr)
 		// An upstream >=400 already has a real status: hand it to the hand-off
 		// synchronously as a status-bearing failed envelope (the existing
 		// upstreamStatusError policy) instead of the lossy in-band text error.
-		if !gate.fail(upstreamStatusError(statusCode, string(errPayload), fullErr)) {
+		// v0.9.74: a heal verdict (session dead / renewed-but-refused) appends
+		// its bilingual re-login guidance.
+		if !gate.fail(verdict.annotate(upstreamStatusError(statusCode, errText, fullErr))) {
 			return
 		}
 		streamEmitError(streamID, fullErr.Error())
@@ -440,14 +488,17 @@ func pumpStreamFrames(scanner *bufio.Scanner, sink streamSink, gate *streamHeadG
 // the upstream, clean each chunk, return them as a slice. The collector, when
 // non-nil, observes raw upstream chunks for usage extraction. statusCode is the
 // upstream HTTP status (0 for transport-level failures).
-func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, collector *sseUsageCollector, upstreamModel string) ([]pluginapi.ExecutorStreamChunk, int, error) {
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChatFor(sa), bytes.NewReader(body))
-	if err != nil {
-		return nil, 0, err
+func collectUpstreamStream(body []byte, sa *storedAuth, authID string, sseFramed bool, collector *sseUsageCollector, upstreamModel string) ([]pluginapi.ExecutorStreamChunk, int, error) {
+	attempt := func(sa *storedAuth) (*hostHTTPStream, int, http.Header, error) {
+		httpReq, err := http.NewRequest(http.MethodPost, endpointChatFor(sa), bytes.NewReader(body))
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		backendHeaders(httpReq, sa)
+		// Compliance: route via host.http.do_stream so request-log captures the call.
+		return hostHTTPDoStream(httpReq)
 	}
-	backendHeaders(httpReq, sa)
-	// Compliance: route via host.http.do_stream so request-log captures the call.
-	stream, statusCode, respHdr, err := hostHTTPDoStream(httpReq)
+	stream, statusCode, respHdr, err := attempt(sa)
 	if err != nil {
 		return nil, 0, fmt.Errorf("http_error: %w", err)
 	}
@@ -455,16 +506,53 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, collecto
 	reader := newHostStreamReader(stream)
 	if statusCode >= 400 {
 		errPayload, _ := io.ReadAll(reader)
+		errText := string(errPayload)
+		// v0.9.74: chat-plane 401 heal (same contract as the sync executor
+		// path — see handleExecExecute). One renewal and one resend BEFORE
+		// the failure bookkeeping, so a rescued request is indistinguishable
+		// from one that worked; the body is reused as-is (the realm family
+		// cannot flip within one credential's refresh — only the auth-bearing
+		// headers and endpoint ride the fresh snapshot).
+		var verdict chat401Verdict
+		if statusCode == http.StatusUnauthorized {
+			outcome, fresh := healChat401(authID, sa)
+			if outcome == chat401HealResend && fresh != nil {
+				stream2, st2, hdr2, err2 := attempt(fresh)
+				if err2 != nil {
+					// The heal worked; the resend's transport failure is the
+					// primary failure now (plain http_error, no credential verdict).
+					return nil, 0, fmt.Errorf("http_error: %w", err2)
+				}
+				defer stream2.Close()
+				reader2 := newHostStreamReader(stream2)
+				if st2 < 400 {
+					chunks, errAgg := aggregateSSEWithCollector(reader2, sseFramed, collector)
+					if errAgg != nil {
+						return chunks, st2, errAgg
+					}
+					return chunks, st2, nil
+				}
+				p2, _ := io.ReadAll(reader2)
+				statusCode, respHdr, errText = st2, hdr2, string(p2)
+				if st2 == http.StatusUnauthorized {
+					verdict.RenewedRefused = true
+				}
+			} else if outcome == chat401SessionDead {
+				verdict.SessionDead = true
+			}
+		}
 		if sa != nil {
-			noteModelRateLimitFromPayload(sa.Account.UID, upstreamModel, statusCode, string(errPayload))
+			noteModelRateLimitFromPayload(sa.Account.UID, upstreamModel, statusCode, errText)
 		}
 		if sa != nil && sa.Account.UID != "" {
-			go reconcileByUID(sa.Account.UID, statusCode, string(errPayload))
+			go reconcileByUID(sa.Account.UID, statusCode, errText)
 		}
 		// v0.9.17: account-level statuses ride the error envelope so the
 		// host cooldown layer stops re-picking a drained credential.
-		return nil, statusCode, upstreamStatusError(statusCode, string(errPayload),
-			translateChatUpstreamErrorFull(statusCode, string(errPayload), sa, respHdr))
+		// v0.9.74: a heal verdict (session dead / renewed-but-refused)
+		// appends its bilingual re-login guidance to the translated error.
+		return nil, statusCode, verdict.annotate(upstreamStatusError(statusCode, errText,
+			translateChatUpstreamErrorFull(statusCode, errText, sa, respHdr)))
 	}
 	chunks, errAgg := aggregateSSEWithCollector(reader, sseFramed, collector)
 	if errAgg != nil {

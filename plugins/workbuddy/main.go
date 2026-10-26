@@ -351,7 +351,7 @@ type registrationCapability struct {
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.9.76"
+var version = "0.9.77"
 
 func wbRegistration() registration {
 	return registration{
@@ -614,6 +614,9 @@ func upstreamBaseFor(sa *storedAuth) string {
 }
 
 func endpointChatFor(sa *storedAuth) string {
+	if chatEndpointOverride != "" {
+		return chatEndpointOverride + "/v2/chat/completions"
+	}
 	return upstreamBaseFor(sa) + "/v2/chat/completions"
 }
 
@@ -621,6 +624,11 @@ func endpointChatFor(sa *storedAuth) string {
 // 到该 base（与 loginEndpointsOverride 同型）。生产恒为空；billing 401 自愈
 // 的 hermetic 测试用它驱动完整的 401→续期→重发链路。
 var refreshEndpointOverride string
+
+// chatEndpointOverride（0.9.74 测试缝）：非空时把 chat 端点重定向到该
+// base（与 refreshEndpointOverride 同型）。生产恒为空；chat 平面 401 自愈
+// 的 hermetic 测试用它驱动完整的 401→续期→重发链路。
+var chatEndpointOverride string
 
 func endpointTokenRefreshFor(sa *storedAuth) string {
 	if refreshEndpointOverride != "" {
@@ -928,41 +936,47 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	// upstream and fold the chunks into a single chat.completion object.
 	// prepareUpstreamBody does forceStream + normalizeTools + rewriteSystem +
 	// ensureSystemMessage + rewriteModel in ONE unmarshal/marshal pass.
-	body := prepareUpstreamBody(req.Payload, req.OriginalRequest, sa, upstreamModel)
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChatFor(sa), bytes.NewReader(body))
-	if err != nil {
-		return nil, err
+	//
+	// v0.9.74: the round trip lives in the attempt closure so a 401 can
+	// renew the credential once and resend once through the SAME pipeline
+	// (the chat half of 0.9.68's billing-plane heal — magpie
+	// packages/workbuddy 0.1.31 renews "a chat or usage read" alike).
+	attempt := func(sa *storedAuth) (status int, hdr http.Header, errPayload string, completion []byte, err error) {
+		body := prepareUpstreamBody(req.Payload, req.OriginalRequest, sa, upstreamModel)
+		httpReq, err := http.NewRequest(http.MethodPost, endpointChatFor(sa), bytes.NewReader(body))
+		if err != nil {
+			return 0, nil, "", nil, err
+		}
+		backendHeaders(httpReq, sa)
+		// Compliance: route via host.http.do_stream so request-log captures the
+		// outbound call. Read entire body via the bridge, then fold SSE → completion.
+		stream, st, hd, err := hostHTTPDoStream(httpReq)
+		if err != nil {
+			return 0, nil, "", nil, fmt.Errorf("http_error: %w", err)
+		}
+		defer stream.Close()
+		reader := newHostStreamReader(stream)
+		if st >= 400 {
+			p, _ := io.ReadAll(reader)
+			return st, hd, string(p), nil, nil
+		}
+		completion, aerr := aggregateCompletion(reader, req.Model)
+		if aerr != nil {
+			return 0, nil, "", nil, aerr
+		}
+		return st, hd, "", completion, nil
 	}
-	backendHeaders(httpReq, sa)
-	// Compliance: route via host.http.do_stream so request-log captures the
-	// outbound call. Read entire body via the bridge, then fold SSE → completion.
-	stream, statusCode, respHdr, err := hostHTTPDoStream(httpReq)
-	if err != nil {
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
-		return nil, fmt.Errorf("http_error: %w", err)
+	succeed := func(completion []byte) ([]byte, error) {
+		publishUsage(req.Model, upstreamModel, authUID, started, usageDetailFromCompletion(completion), false, 0, "")
+		// v0.9.25: learn the real model behind a tier alias from the response echo.
+		noteLearnedRealModel(upstreamModel, modelFromCompletionPayload(completion))
+		// v0.9.73: a normal answer clears any restriction state — a restriction
+		// lifted upstream self-heals the credential without operator action.
+		noteAccountHealthy(req.AuthID, sa)
+		invalidateAccountCredits(req.AuthID, authUID)
+		return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
 	}
-	defer stream.Close()
-	reader := newHostStreamReader(stream)
-	if statusCode >= 400 {
-		payload, _ := io.ReadAll(reader)
-		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, string(payload))
-		noteModelRateLimitFromPayload(authUID, upstreamModel, statusCode, string(payload))
-		// v0.9.73: 403+11140 quarantines the credential (account restricted
-		// upstream) — the pick filter and executor fast-fail hold it out of
-		// rotation until the backoff window lapses or a healthy answer clears it.
-		noteAccountRestrictionFromPayload(req.AuthID, sa, statusCode, string(payload))
-		// Issue #35: >=400 failures feed the per-(credential, model) cooldown
-		// table (6004 keeps its own registry — the classifier defers to it).
-		noteModelCooldownFailure(req.AuthID, sa, upstreamModel, statusCode, string(payload))
-		reconcileAfterExecutorError(req.AuthID, statusCode, string(payload))
-		// v0.12.18: 11102 model-catalog rejections become a bilingual,
-		// realm-aware actionable error; 0.9.14 adds 11115/WAF/Retry-After
-		// shapes on top (header-aware full translator).
-		// v0.9.17: wrap with the account-level HTTP status so the host
-		// applies its real cooldown policy to this credential.
-		return nil, upstreamStatusError(statusCode, string(payload), translateChatUpstreamErrorFull(statusCode, string(payload), sa, respHdr))
-	}
-	completion, err := aggregateCompletion(reader, req.Model)
+	statusCode, respHdr, errPayload, completion, err := attempt(sa)
 	if err != nil {
 		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
 		// Issue #35: in-stream frame errors / empty streams from the fold path
@@ -970,14 +984,56 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		noteModelCooldownFailure(req.AuthID, sa, upstreamModel, 0, err.Error())
 		return nil, err
 	}
-	publishUsage(req.Model, upstreamModel, authUID, started, usageDetailFromCompletion(completion), false, 0, "")
-	// v0.9.25: learn the real model behind a tier alias from the response echo.
-	noteLearnedRealModel(upstreamModel, modelFromCompletionPayload(completion))
-	// v0.9.73: a normal answer clears any restriction state — a restriction
-	// lifted upstream self-heals the credential without operator action.
-	noteAccountHealthy(req.AuthID, sa)
-	invalidateAccountCredits(req.AuthID, authUID)
-	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
+	if statusCode >= 400 {
+		// v0.9.74: chat-plane 401 heal — the APISIX gateway bounces a dead
+		// access token with the openresty "401 Authorization Required" HTML
+		// page (2026-10-26 field report, Buddycn account). One renewal and
+		// one resend happen here, BEFORE any failure bookkeeping, so a
+		// rescued request is indistinguishable from one that simply worked;
+		// a resend that still fails becomes the primary failure below.
+		var verdict chat401Verdict
+		if statusCode == http.StatusUnauthorized {
+			outcome, fresh := healChat401(req.AuthID, sa)
+			switch outcome {
+			case chat401HealResend:
+				st2, hdr2, p2, comp2, err2 := attempt(fresh)
+				if err2 == nil && st2 < 400 {
+					return succeed(comp2)
+				}
+				if err2 == nil && st2 >= 400 {
+					statusCode, respHdr, errPayload = st2, hdr2, p2
+					if st2 == http.StatusUnauthorized {
+						verdict.RenewedRefused = true
+					}
+				} else {
+					publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err2.Error())
+					noteModelCooldownFailure(req.AuthID, sa, upstreamModel, 0, err2.Error())
+					return nil, err2
+				}
+			case chat401SessionDead:
+				verdict.SessionDead = true
+			}
+		}
+		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, errPayload)
+		noteModelRateLimitFromPayload(authUID, upstreamModel, statusCode, errPayload)
+		// v0.9.73: 403+11140 quarantines the credential (account restricted
+		// upstream) — the pick filter and executor fast-fail hold it out of
+		// rotation until the backoff window lapses or a healthy answer clears it.
+		noteAccountRestrictionFromPayload(req.AuthID, sa, statusCode, errPayload)
+		// Issue #35: >=400 failures feed the per-(credential, model) cooldown
+		// table (6004 keeps its own registry — the classifier defers to it).
+		noteModelCooldownFailure(req.AuthID, sa, upstreamModel, statusCode, errPayload)
+		reconcileAfterExecutorError(req.AuthID, statusCode, errPayload)
+		// v0.12.18: 11102 model-catalog rejections become a bilingual,
+		// realm-aware actionable error; 0.9.14 adds 11115/WAF/Retry-After
+		// shapes on top (header-aware full translator).
+		// v0.9.17: wrap with the account-level HTTP status so the host
+		// applies its real cooldown policy to this credential.
+		// v0.9.74: a heal verdict (session dead / renewed-but-refused)
+		// appends its bilingual re-login guidance to the translated error.
+		return nil, verdict.annotate(upstreamStatusError(statusCode, errPayload, translateChatUpstreamErrorFull(statusCode, errPayload, sa, respHdr)))
+	}
+	return succeed(completion)
 }
 
 // executorStreamRequest wraps the host's executor.execute_stream RPC: the
@@ -1044,7 +1100,9 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if req.StreamID == "" {
 		defer releaseSlot()
 		collector := &sseUsageCollector{}
-		chunks, statusCode, errCollect := collectUpstreamStream(body, sa, sseFramed, collector, upstreamModel)
+		// v0.9.74: authID rides along so the chat-401 heal inside the
+		// collector can resolve the credential's host identity.
+		chunks, statusCode, errCollect := collectUpstreamStream(body, sa, req.AuthID, sseFramed, collector, upstreamModel)
 		if errCollect != nil {
 			publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, errCollect.Error())
 			// Issue #35: the sync collector surfaces frame errors,
@@ -1079,6 +1137,19 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		return okEnvelope(streamResponse{Headers: headers})
 	}
 	backendHeaders(httpReq, sa)
+	// v0.9.74: the pump rebuilds the request from the fresh snapshot when a
+	// chat 401 is healed (same ctx — the hand-off lifetime is unchanged; the
+	// body is reused as-is: the realm family cannot flip within one
+	// credential's refresh, only the auth-bearing headers and endpoint ride
+	// the fresh snapshot).
+	buildReq := func(fresh *storedAuth) (*http.Request, error) {
+		r, rerr := http.NewRequestWithContext(ctx, http.MethodPost, endpointChatFor(fresh), bytes.NewReader(body))
+		if rerr != nil {
+			return nil, rerr
+		}
+		backendHeaders(r, fresh)
+		return r, nil
+	}
 	// stream_head_timeout (opt-in): when configured > 0, hold the async
 	// hand-off until the pump reports its first decisive upstream event, so a
 	// failure that lands before the model answers becomes a status-bearing
@@ -1093,7 +1164,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	// of async), so the release rides the goroutine, not this function.
 	go func() {
 		defer releaseSlot()
-		pumpUpstreamStream(httpReq, cancel, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID, sa, gate)
+		pumpUpstreamStream(httpReq, buildReq, cancel, req.StreamID, sseFramed, req.Model, upstreamModel, authUID, started, req.AuthID, sa, gate)
 	}()
 	if gate != nil {
 		if headErr := awaitStreamHead(gate); headErr != nil {

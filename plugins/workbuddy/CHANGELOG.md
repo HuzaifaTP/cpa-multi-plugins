@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.77
+
+### Chat-plane 401 self-heal: renew once and resend once (field report 2026-10-26, Buddycn account)
+
+Field report: an account's every chat request surfaced as HTTP 500 `upstream 401: <html>…401 Authorization Required…openresty…` — the APISIX gateway bouncing the access token with its HTML error page. That page is the documented signature of a dead Keycloak offline session (see keepalive.go): the token is rejected before any business logic runs, and nothing in the plugin can revive the session — only re-login can.
+
+- Root cause: 0.9.68 wired the 401 renew-once on the BILLING plane only (magpie packages/workbuddy 0.1.31 parity — "a chat or usage read WorkBuddy answers 401 is renewed once … and sent once more"), but the CHAT half never landed. A chat 401 got only the host's 30-minute credential cooldown, which retries the SAME dead access token after the window: the user sees 401→500 after 401→500 until a keepalive tick or a billing call happens to renew the credential, and the surfaced error is the raw openresty HTML with no actionable guidance.
+- New `chat_401_heal.go`: `healChat401` resolves the credential's host identity (the executor snapshot carries no authIndex; same resolution `reconcileAfterExecutorError` applies) and drives the shared `billing401RenewOnce`. Outcomes: renewed → the caller resends once with the fresh snapshot; refresh refused with the session-dead family (12153) → the credential is already flagged disabled by the shared renewal and the error carries bilingual re-login guidance; throttled/identity-less → the exact pre-0.9.77 raw-401 behavior (the next request retries the heal).
+- Wiring: all three chat executor paths (sync `handleExecExecute`, stream sync-collector `collectUpstreamStream`, async `pumpUpstreamStream`). The heal runs BEFORE any failure bookkeeping, so a rescued request is indistinguishable from one that simply worked — no failed-usage entry, no cooldown notes; a resend that still fails becomes the primary failure (a second 401 appends the "renewed once and still refused — re-login" guidance). Only real HTTP 401 round trips are healed; in-stream unauthorized-looking frames keep their status-less path.
+- `billing401RenewOnce` concurrency upgrade: callers that arrive while a renewal is in flight now JOIN it and take what it gave (magpie's renewing-map semantics) instead of failing "throttled" — a fan-out of 401s spends the refresh token exactly once, on both planes. The 30s window now only gates starting a NEW renewal when nothing is running.
+- New test seam `chatEndpointOverride` (same shape as `refreshEndpointOverride`) drives the full 401→renew→resend chain hermetically; `chat_401_heal_test.go` pins the heal end-to-end on the sync executor and the sync collector, the session-dead disable + guidance, the renewed-but-refused guidance, and the throttled raw-401 passthrough.
 ## 0.9.76
 
 ### oneOf of objects with no type gets type:object — Kimi 400 fix (magpie workbuddy 0.1.33, #378)
