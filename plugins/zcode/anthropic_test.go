@@ -427,16 +427,86 @@ func TestApplyStartPlanTransformShape(t *testing.T) {
 	if json.Unmarshal([]byte(uid), &parsed) != nil {
 		t.Fatalf("user_id not JSON: %q", uid)
 	}
-	if parsed["device_id"] != "device-mid-1" || parsed["account_uuid"] != "" || parsed["session_id"] != "" {
-		t.Fatalf("user_id blob = %+v", parsed)
+	// v0.2.6 (#388): session_id is the conversation's stable UUID — same one
+	// x-session-id carries; a non-empty UUIDv4 shape here.
+	sess, _ := parsed["session_id"].(string)
+	if parsed["device_id"] != "device-mid-1" || parsed["account_uuid"] != "" || !isUUIDv4Shape(sess) {
+		t.Fatalf("user_id blob = %+v (session_id=%q)", parsed, sess)
 	}
 }
 
+// isUUIDv4Shape reports whether s is a lower-case UUIDv4-shaped string
+// (8-4-4-4-12, version 4 / variant bits).
+func isUUIDv4Shape(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		case 14:
+			if c != '4' {
+				return false
+			}
+		case 19:
+			if c != '8' && c != '9' && c != 'a' && c != 'b' {
+				return false
+			}
+		default:
+			if !(c == '-' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func TestBuildAnthropicMetadataUserIdShape(t *testing.T) {
-	got := buildAnthropicMetadataUserId("dm-1")
-	want := `{"device_id":"dm-1","account_uuid":"","session_id":""}`
+	got := buildAnthropicMetadataUserId("dm-1", "sess-uuid")
+	want := `{"device_id":"dm-1","account_uuid":"","session_id":"sess-uuid"}`
 	if got != want {
 		t.Fatalf("user_id = %s, want %s", got, want)
+	}
+	if tail := buildAnthropicMetadataUserId("dm-1", ""); strings.Contains(tail, "sess-uuid") {
+		t.Fatalf("empty session must not leak: %s", tail)
+	}
+}
+
+// TestConversationSessionIDStability — the cache-hit property (#388): the
+// same conversation derives the same UUID on every turn (the first user
+// message never changes), a different conversation gets a different UUID,
+// and with no user turn the device-derived fallback is stable per device.
+func TestConversationSessionIDStability(t *testing.T) {
+	turn1 := []byte(`{"model":"glm-5.3","messages":[{"role":"system","content":"sys"},{"role":"user","content":"fix the bug"},{"role":"assistant","content":"ok"}]}`)
+	turn2 := []byte(`{"model":"glm-5.3","messages":[{"role":"system","content":"sys"},{"role":"user","content":"fix the bug"},{"role":"assistant","content":"ok"},{"role":"user","content":"also the tests"}]}`)
+	other := []byte(`{"model":"glm-5.3","messages":[{"role":"user","content":"different conversation entirely"}]}`)
+
+	s1 := conversationSessionID(turn1, "dev-1")
+	if s1 != conversationSessionID(turn2, "dev-1") {
+		t.Fatal("the same conversation must derive the same session UUID on every turn")
+	}
+	if s1 == conversationSessionID(other, "dev-1") {
+		t.Fatal("a different conversation must get a different session UUID")
+	}
+	if !isUUIDv4Shape(s1) {
+		t.Fatalf("the session id must be a lower-case UUIDv4 shape, got %q", s1)
+	}
+	// No user turn → device fallback, stable per device, distinct across devices.
+	sysOnly := []byte(`{"messages":[{"role":"system","content":"sys"}]}`)
+	if conversationSessionID(sysOnly, "dev-1") != conversationSessionID([]byte(`{"messages":[{"role":"system","content":"sys"}]}`), "dev-1") {
+		t.Fatal("the device fallback must be stable")
+	}
+	if conversationSessionID(sysOnly, "dev-1") == conversationSessionID(sysOnly, "dev-2") {
+		t.Fatal("different devices must derive different fallback sessions")
+	}
+	// The anthropic parts shape parses the same way (the translated body's
+	// first user turn is what applyStartPlanTransform probes).
+	anthro := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"fix the bug"}]}]}`)
+	if conversationSessionID(anthro, "dev-1") != conversationSessionID(turn1, "dev-1") {
+		t.Fatal("the anthropic parts shape and the plain string must key the same conversation")
 	}
 }
 
@@ -1015,8 +1085,14 @@ func TestHandleExecExecuteStartPlan(t *testing.T) {
 	if c.headers.Get("x-zcode-session-type") != "main" {
 		t.Fatalf("session-type = %q", c.headers.Get("x-zcode-session-type"))
 	}
-	if c.headers.Get("x-query-id") != "" || c.headers.Get("x-session-id") != "" {
-		t.Fatal("start-plan must omit x-query-id/x-session-id")
+	if c.headers.Get("x-query-id") != "" {
+		t.Fatal("start-plan must omit x-query-id (the client has no query context on this plane)")
+	}
+	// v0.2.6 (magpie zcode 2b56b3b, #388): x-session-id now rides the start
+	// plan too — the conversation's stable UUID (BigModel's prompt cache keys
+	// on it; the 0.2.4 omission predated the session discovery).
+	if sid := c.headers.Get("x-session-id"); !isUUIDv4Shape(sid) {
+		t.Fatalf("start-plan x-session-id must be the conversation UUID, got %q", sid)
 	}
 	// 0.2.4 (magpie packages/zcode 0.1.22): 3.16's model-request
 	// attribution header and the moved app version.

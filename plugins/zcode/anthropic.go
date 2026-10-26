@@ -113,14 +113,16 @@ func normalizeGlm53Effort(effort string) string {
 // buildAnthropicMetadataUserId renders the metadata.user_id blob the real
 // client attaches to EVERY anthropic-kind request (bundle `E2e`/`UIo`):
 //
-//	{"device_id": deviceMid, "account_uuid": "", "session_id": ""}
+//	{"device_id": deviceMid, "account_uuid": "", "session_id": "<conversation UUID>"}
 //
 // account_uuid is ALWAYS "" (hardcoded empty in the real bundle — never the
-// account uuid). session_id strips the sess_/subagent_agent_ prefixes and is
-// "" when no session context exists (our per-request trace UUIDs are not
-// client sessions, so we pass "").
-func buildAnthropicMetadataUserId(deviceMid string) string {
-	return fmt.Sprintf(`{"device_id":%s,"account_uuid":"","session_id":""}`, mustJSONString(strings.TrimSpace(deviceMid)))
+// account uuid). v0.2.6 (magpie zcode 2b56b3b, #388): session_id is now the
+// conversation's stable UUID — the same one x-session-id carries on the
+// wire, as in ZCode's own requests (metadata.user_id.session_id). Our host
+// carries no session context, so it is derived from the conversation's
+// first user turn (conversationSessionID), with the device-derived fallback.
+func buildAnthropicMetadataUserId(deviceMid, sessionID string) string {
+	return fmt.Sprintf(`{"device_id":%s,"account_uuid":"","session_id":%s}`, mustJSONString(strings.TrimSpace(deviceMid)), mustJSONString(strings.TrimSpace(sessionID)))
 }
 
 // openAIMessage is the permissive OpenAI chat message shape the translator
@@ -282,7 +284,15 @@ func applyStartPlanTransform(body map[string]any, userSystem []systemBlock, curr
 		}
 	}
 	applyAnthropicCacheControl(body)
-	body["metadata"] = map[string]any{"user_id": buildAnthropicMetadataUserId(deviceMid)}
+	// v0.2.6 (magpie zcode 2b56b3b, #388): the conversation's stable UUID
+	// rides metadata.user_id.session_id — the same UUID x-session-id carries
+	// on the wire, as ZCode's own requests do. conversationSessionID parses
+	// the {type:"text"} parts shape the anthropic translation produces.
+	sessionRaw, serr := json.Marshal(body)
+	if serr != nil {
+		sessionRaw = nil
+	}
+	body["metadata"] = map[string]any{"user_id": buildAnthropicMetadataUserId(deviceMid, conversationSessionID(sessionRaw, deviceMid))}
 }
 
 // relocateUserSystemIntoFirstTurn prepends the caller's own system text to the

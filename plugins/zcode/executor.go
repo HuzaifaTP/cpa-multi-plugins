@@ -110,7 +110,11 @@ func applyChatHeaders(req *http.Request, sa *storedAuth, body string) {
 	for k, v := range buildLlmIdentityHeaders(zcodeIdentity()) {
 		req.Header.Set(k, v)
 	}
-	applyTraceHeaders(req)
+	// v0.2.6 (magpie zcode 2b56b3b, #388): x-session-id is the CONVERSATION's
+	// stable UUID — BigModel keys its prompt cache on it (3/12 turns hit with a
+	// per-request fresh UUID, 24/24 with a stable one). The other trace
+	// headers stay per-request: they name THIS request, not the conversation.
+	applyTraceHeaders(req, conversationSessionID([]byte(body), sa.Auth.DeviceMid))
 	req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)
 	ua := req.Header.Get("User-Agent")
 	if ua != "" {
@@ -120,12 +124,15 @@ func applyChatHeaders(req *http.Request, sa *storedAuth, body string) {
 
 // applyTraceHeaders mirrors the client's attribution header set for
 // coding-plan traffic: five UUID-attributed headers with session-type main.
-func applyTraceHeaders(req *http.Request) {
+// v0.2.6: x-session-id is now the caller-provided CONVERSATION UUID
+// (conversationSessionID) instead of a fresh per-request UUID — a fresh one
+// never let BigModel's prompt cache hit (#388).
+func applyTraceHeaders(req *http.Request, sessionID string) {
 	req.Header.Set("x-request-id", uuid.NewString())
 	req.Header.Set("x-zcode-session-type", "main")
 	req.Header.Set("x-zcode-trace-id", uuid.NewString())
 	req.Header.Set("x-query-id", uuid.NewString())
-	req.Header.Set("x-session-id", uuid.NewString())
+	req.Header.Set("x-session-id", sessionID)
 }
 
 // sessionIdFromRequest extracts the x-session-id value — the signing message
@@ -155,6 +162,13 @@ func applyStartPlanChatHeaders(req *http.Request, sa *storedAuth, body string) {
 	req.Header.Set("x-request-id", uuid.NewString())
 	req.Header.Set("x-zcode-session-type", "main")
 	req.Header.Set("x-zcode-trace-id", uuid.NewString())
+	// v0.2.6 (magpie zcode 2b56b3b, #388): every zcode request names its
+	// conversation in x-session-id, on the Start Plan like the coding plan —
+	// BigModel's prompt cache follows it. This supersedes 0.2.4's omission
+	// (0.1.22's header set predated the session discovery); the whitelist
+	// discipline is unchanged — this is a plugin-owned UUID, never an agent
+	// header riding through.
+	req.Header.Set("x-session-id", conversationSessionID([]byte(body), sa.Auth.DeviceMid))
 	// 0.2.4 (magpie packages/zcode 0.1.22): ZCode 3.16's
 	// createModelRequestAttributionHeaders attributes what asked the
 	// model — main_turn for a chat turn — and the start-plan gateway

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.6
+
+### Every request names its conversation in x-session-id — BigModel's prompt cache hits (magpie zcode 2b56b3b, #388)
+
+ZCode's client names every request's conversation in `x-session-id`: a bare lower-case UUID, the same on each turn. BigModel keys its prompt cache on it — the upstream author's numbers: **3/12** turns hit the cache with a fresh per-request UUID, **24/24** with a stable one (#387). We were sending a fresh `uuid.NewString()` per request on the coding-plan trace set (and omitting the header on the start plan), so a long conversation almost never hit the cache.
+
+- New `session_id.go`: `conversationSessionID(payload, deviceMid)` derives the conversation's stable UUID — from the conversation's FIRST USER MESSAGE (our host's ExecutorRequest carries no session context; the first user message never changes within a conversation, so the id is the same on every turn; magpie's device-derived UUID is the fallback when no user turn exists). Rendered as a lower-case UUIDv4 shape (8-4-4-4-12, version/variant bits) — exactly what the official client's `crypto.randomUUID()` produces.
+- Coding plan (`applyChatHeaders`): x-session-id is the conversation UUID; the other trace headers (request/trace/query) stay per-request — they name THIS request, not the conversation. The V4 signing ladder still reads the header the request carries (`sessionIdFromRequest`), so the binding is unchanged.
+- Start plan (`applyStartPlanChatHeaders`): the header now rides this plane too — magpie 2b56b3b sends it on every zcode request ("on the Start Plan and on Coding Plan or team seats alike"), superseding 0.2.4's omission; the whitelist discipline is unchanged (plugin-owned UUID, never an agent header).
+- `metadata.user_id.session_id` carries the SAME UUID (in `buildAnthropicMetadataUserId`), as ZCode's own requests do — was hardcoded empty.
+- Tests: `TestConversationSessionIDStability` (same conversation → same UUID across turns; different conversation → different; device fallback stable per device, distinct across devices; the anthropic `{type:"text"}` parts shape keys the same as the plain-string shape), the start-plan header assertion updated (x-query-id still omitted, x-session-id present as a UUID), and the metadata blob assertions. Full zcode suite green under `-race`.
+
 ## 0.2.5
 
 ### 405 code 3012 says ZCode's risk control blocked the account (magpie zcode 0.1.27, #348)
