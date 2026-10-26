@@ -361,9 +361,20 @@ func mirrorReasoningEffort(obj map[string]any) bool {
 	return false
 }
 
-// compactToolDescriptions strips tool.function.description when the serialized
-// tools array exceeds toolDescriptionByteLimit (64KB). Tencent's body-size
-// filter rejects large tool descriptions. Mirrors OmniRoute codebuddy-cn.ts.
+// compactToolDescriptions strips tool descriptions when the serialized tools
+// array exceeds toolDescriptionByteLimit (64KB). Tencent's body-size filter
+// rejects large tool descriptions. Mirrors OmniRoute codebuddy-cn.ts.
+//
+// v0.9.72 (issue #63): the old loop only understood the chat-completions
+// nested shape (tool.function.description), so two Responses-API shapes slid
+// through UNCOMPRESSED: flat function tools ({"type":"function","name":...,
+// "description":...}) and MCP namespace tools ({"type":"namespace","name":
+// "mcp__rea","description":...,"tools":[...]}). A Codex Desktop session with
+// the full mcp__rea extension serializes 322KB of tool definitions — the
+// compactor saw none of it (every tool hit the `continue`), the full payload
+// reached Moonshot, and kimi-k3.1-pro answered upstream 400 code=11133 /
+// extError 400001 "rejected by the model provider" 100% of the time. The
+// cleaner now walks all three shapes recursively.
 func compactToolDescriptions(obj map[string]any) bool {
 	tools, ok := obj["tools"].([]any)
 	if !ok || len(tools) == 0 {
@@ -377,19 +388,36 @@ func compactToolDescriptions(obj map[string]any) bool {
 		return false
 	}
 	changed := false
-	for _, t := range tools {
+	var cleanTool func(t any)
+	cleanTool = func(t any) {
 		tool, ok := t.(map[string]any)
 		if !ok {
-			continue
+			return
 		}
-		fn, ok := tool["function"].(map[string]any)
-		if !ok {
-			continue
+		// 1. Standard chat-completions nesting: tool.function.description.
+		if fn, ok := tool["function"].(map[string]any); ok {
+			if _, hasDesc := fn["description"]; hasDesc {
+				delete(fn, "description")
+				changed = true
+			}
 		}
-		if _, hasDesc := fn["description"]; hasDesc {
-			delete(fn, "description")
+		// 2. Flat shape (Responses API / built-in tools): description at the
+		// tool's own top level. For the nested shape this key simply is not
+		// present, so the delete is a no-op there.
+		if _, hasDesc := tool["description"]; hasDesc {
+			delete(tool, "description")
 			changed = true
 		}
+		// 3. MCP namespace shape: the functions live under tool["tools"] —
+		// the 170-tool mcp__rea payload carries almost all of its 322KB here.
+		if subTools, ok := tool["tools"].([]any); ok {
+			for _, sub := range subTools {
+				cleanTool(sub)
+			}
+		}
+	}
+	for _, t := range tools {
+		cleanTool(t)
 	}
 	return changed
 }

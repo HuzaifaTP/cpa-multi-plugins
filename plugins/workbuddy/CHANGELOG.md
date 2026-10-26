@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.9.72
+
+### Tool compaction covers the Responses-API tool shapes (issue #63)
+
+Field report (2026-10-25, Codex Desktop on the Responses API): a session loading the full `mcp__rea` extension (170 functions, 322KB serialized tool definitions) failed 100% of the time with upstream 400 `code=11133` / `extError 400001` ("rejected by the model provider") on `kimi-k3.1-pro`, then tripped the 60s unknown-model cooldown into `503 auth_unavailable`.
+
+- Root cause: `compactToolDescriptions` only understood the chat-completions nesting (`tool.function.description`). Two Responses-API shapes slid through UNCOMPRESSED — flat function tools (`{"type":"function","name":…,"description":…}`) and MCP namespace tools (`{"type":"namespace","name":"mcp__rea","description":…,"tools":[…]}`, which is where the 322KB actually lived). Every one of those tools hit the `continue`; the full payload reached Moonshot and its schema-size validation refused it.
+- The cleaner now walks all three shapes recursively: nested, flat, and namespace (including namespace-inside-namespace), stripping only `description` fields once the serialized array crosses the existing 64KB threshold. Identity keys (`type`/`name`/`parameters`/nested `tools`) are untouched; under-limit payloads remain byte-for-byte unchanged.
+- Pinned by `payload_compact_test.go`: five cases including the exact field-scale shape (170 flat functions inside one namespace + ordinary tools) asserting the post-compaction payload lands back under the limit.
+
+## 0.9.71
+
+### Opt-in credit guardrails for scheduler pick (PR #64, implements #61)
+
+Two knobs, both default-off, both pure consumers of the existing credits cache (the #56-era standing constraint: guardrails add zero upstream calls):
+
+- **`reserve_credits`** — skip a credential in scheduler pick once its cached remaining credits are <= the reserve, keeping the account usable for the official client / emergencies instead of drained to zero by routine pool traffic.
+- **`daily_credits_cap`** — skip once same-day spend reaches the cap; spend = day-start remaining − current remaining from the same credits plane. Day boundary is the UTC+8 calendar day (upstream's 6004 reset copy phrases windows in Beijing time); counters are in-memory — estimative state, so a restart under-count errs toward firing later.
+- Placement: the `handleSchedulerPick` skip — a guarded credential is simply not offered as a candidate (invisible to the host, no retry budget consumed), layering with #60's admission control (admission owns concurrency, guardrails own balance). When every candidate is guarded the pick defers to the host with a WARN log. Only effective with `scheduler_mode: credits`; README/config-description documents the limitation.
+- Config shape: global defaults plus per-credential overrides (`reserve_credits` / `daily_credits_cap` numbers at the auth document top level; absent = inherit, 0 = disable for that credential). Pointer fields + `omitempty` keep nil vs explicit 0 distinct and preserve panel-set values across token refreshes.
+
 ## 0.9.70
 
 ### Per-account machine identity on the billing plane (PR #58, implements #57)

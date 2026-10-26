@@ -7,8 +7,8 @@ import (
 
 func storeCreditsFor(authID string, remain int64, reserveOv, capOv *int64) {
 	accountCache.Store(authID, &accountCacheEntry{
-		credits:         &creditsSummary{TotalRemain: remain},
-		reserveOverride: reserveOv,
+		credits:          &creditsSummary{TotalRemain: remain},
+		reserveOverride:  reserveOv,
 		dailyCapOverride: capOv,
 	})
 }

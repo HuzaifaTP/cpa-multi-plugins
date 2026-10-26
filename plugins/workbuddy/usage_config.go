@@ -116,11 +116,11 @@ func configure(raw []byte) {
 	nextKeepaliveAuto := true
 	nextTasksAuto := true
 	nextMgmtKey := ""
-	nextLoginPlatform := ""       // sticky: empty = keep current (issue #24)
-	nextLoginRegion := ""         // sticky: empty = keep current (issue #24)
-	nextStreamHeadTimeout := 0    // default off: 0 seconds
-	nextAccountMaxConcurrent := 0 // default off: admission control disabled
-	nextReserveCredits := int64(0) // default off: guardrail disabled (#61)
+	nextLoginPlatform := ""         // sticky: empty = keep current (issue #24)
+	nextLoginRegion := ""           // sticky: empty = keep current (issue #24)
+	nextStreamHeadTimeout := 0      // default off: 0 seconds
+	nextAccountMaxConcurrent := 0   // default off: admission control disabled
+	nextReserveCredits := int64(0)  // default off: guardrail disabled (#61)
 	nextDailyCreditsCap := int64(0) // default off: guardrail disabled (#61)
 
 	nextPinned := map[string][]string{}
