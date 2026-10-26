@@ -106,6 +106,13 @@ func TestIsTransientBillingErr_TransportClassified(t *testing.T) {
 		`Post "https://x": net/http: TLS handshake timeout`,
 		`Post "https://x": dial tcp: lookup www.codebuddy.cn: no such host`,
 		`Post "https://x": dial tcp 1.2.3.4:443: connect: connection refused`,
+		// 0.9.74: the pooled-transport cut the 0.9.66 demotion list knew
+		// about but the transient list missed — the CI flake shape
+		// (billing_exhaustion_test.go:181, 2026-10-26): must ride the
+		// ladder, not escape it.
+		`Post "http://127.0.0.1:43271/v2/billing/meter/get-user-resource": http: server closed idle connection`,
+		`Post "https://x": unexpected EOF`,
+		`Post "https://x": tls: failed to verify certificate: x509: certificate signed by unknown authority`,
 	}
 	for _, msg := range retryable {
 		if !isTransientBillingErr(errors.New(msg)) {

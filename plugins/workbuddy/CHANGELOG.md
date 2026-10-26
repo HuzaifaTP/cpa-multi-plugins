@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.74
+
+### The retry ladder's transient classifier derives from conn-level (single source of truth)
+
+Reproduced the 0.9.66-era CI flake live on 2026-10-26 (`-race` full suite, ~50% of runs): `TestBillingExhaustionTransportKeepsUnreachableWording` failed with the raw one-shot error `Post "http://127.0.0.1:PORT/...": http: server closed idle connection` — no retries, no `unreachable after N attempts` summary, no proxy hint.
+
+- Root cause: two hand-kept transport-classification lists had drifted apart. 0.9.66 added `server closed idle connection` / `unexpected EOF` (and `tls:` broadly) to `isConnLevelBillingErr` — the demotion list — but never to `isTransientBillingErr`, so a pooled keep-alive conn the peer cut broke the retry loop at the transient check *before* the demote branch could run: the exact "escape as an unclassified one-shot error" class 0.9.66's comment promised to close. Same hole for truncated bodies (`unexpected EOF`) and every TLS-class death (cert verification, record-layer errors) — all demote-classified but not ladder-riding.
+- Fix: `isTransientBillingErr` now derives from `isConnLevelBillingErr` (transient = 5xx ∪ conn-level ∪ DNS-miss/connection-refused), making "every connection-level death rides the ladder" structural instead of list-synced — the lists cannot drift again. `parse failed:` / `code=` / credential-rejection shapes stay terminal via the existing app-layer exclusion, including `parse failed: unexpected EOF` (server answered with garbage).
+- Hermetic evidence: full `-race` suite went from intermittent FAIL to 3× consecutive green; new drift-guard block in `TestBillingErrClassifications` asserts every known conn-level family is also transient, and `TestIsTransientBillingErr_TransportClassified` pins the three field shapes (idle-conn cut, truncated body, x509 failure) as retryable.
+
 ## 0.9.73
 
 ### Account-restriction quarantine for 403+11140 (field report 2026-10-26)

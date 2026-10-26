@@ -220,6 +220,18 @@ func TestBillingErrClassifications(t *testing.T) {
 			t.Fatalf("%v must classify as connection-level", e)
 		}
 	}
+	// 0.9.74 drift-guard: every connection-level death must ALSO be
+	// transient (ride the retry ladder). 0.9.66 added idle-conn cuts and
+	// truncated bodies to the demotion list but not the transient list, so
+	// they escaped the ladder as one-shot errors — the exact bug class this
+	// block pins shut. The invariant is now structural (transient derives
+	// from conn-level), and this asserts the known error families keep
+	// riding the ladder if anyone ever re-splits the lists.
+	for _, e := range []error{eof, reset, tlsErr, idleClosed, truncated} {
+		if !isTransientBillingErr(e) {
+			t.Fatalf("%v is connection-level but escaped the retry ladder (not transient) — classification lists drifted again", e)
+		}
+	}
 	for _, e := range []error{fiveHundred, business, parse, nil, internal} {
 		if isConnLevelBillingErr(e) {
 			t.Fatalf("%v must NOT classify as connection-level", e)

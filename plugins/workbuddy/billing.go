@@ -317,18 +317,28 @@ func isTransientBillingErr(err error) bool {
 	if isAppLayerBillingErr(err) {
 		return false
 	}
-	transport := []string{
-		": EOF",                     // Go http client: server closed without a response
-		"connection reset",          // TCP RST mid-request
-		"broken pipe",               // write after peer closed
-		"Client.Timeout",            // http.Client Timeout exceeded
-		"context deadline exceeded", // per-request ctx budget (host bridge too)
-		"TLS handshake timeout",     // net/http handshake dial
-		"i/o timeout",               // dial/read deadline
-		"no such host",              // DNS miss (transient resolver flaps)
-		"connection refused",        // listener temporarily down
+	// 0.9.74: a connection-level death is retryable BY DEFINITION. The two
+	// hand-kept lists drifted apart once already — 0.9.66 added
+	// "server closed idle connection" / "unexpected EOF" to the conn-level
+	// demotion list but not here, so a pooled keep-alive conn the peer cut
+	// escaped the ladder as a one-shot error instead of riding it (the exact
+	// escape class 0.9.66's comment promised to close; CI flake reproduced
+	// 2026-10-26 under -race when a hermetic test port got reused and the
+	// pooled transport handed the ladder the stale conn first). Transient now
+	// derives from conn-level — the single source of truth — so the lists
+	// cannot drift again.
+	if isConnLevelBillingErr(err) {
+		return true
 	}
-	for _, pat := range transport {
+	// Resolver / listener failures are retry-worthy (the next attempt may
+	// land on a different edge or the listener may be back) but NOT
+	// demote-worthy: there is no dialed IP to blame for a DNS miss or a
+	// refused SYN, so they stay out of the conn-level list.
+	resolver := []string{
+		"no such host",       // DNS miss (transient resolver flaps)
+		"connection refused", // listener temporarily down
+	}
+	for _, pat := range resolver {
 		if strings.Contains(msgOf(err), pat) {
 			return true
 		}
